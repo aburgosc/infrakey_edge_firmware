@@ -1,0 +1,40 @@
+# Python / MicroPython caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Runtime credentials and local configuration
+token.json
+device_config.json
+
+# Runtime state and queues
+commands_queue.jsonl
+commands_dead.jsonl
+commands_state.json
+outbox.jsonl
+outbox_state.json
+
+# Legacy local command folders
+commands_inbox/
+commands_done/
+
+# Local backups and temporary files
+*.bak
+*.tmp
+*.log
+*.zip
+
+# Documentation visibility for client delivery
+docs/*
+!docs/PLAN_VALIDATION.md
+!docs/device_config.terreno.example.json
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

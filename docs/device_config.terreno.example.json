@@ -1,0 +1,85 @@
+{
+  "host": "api.infrakey.fasttrack.cloud",
+  "port": 443,
+  "nb_band": 28,
+  "apn_fallback": "m2m.entel.cl",
+  "user_agent": "pico-sim7080g/caopen-infrakey-1.3",
+  "fw": "v1.0.0",
+  "model": "Raspberry-Pi-G4",
+  "latitude": -33.4489,
+  "longitude": -70.6693,
+  "heartbeat_interval_sec": 900,
+  "heartbeat_interval_min_sec": 60,
+  "heartbeat_interval_max_sec": 86400,
+  "next_pull_min_sec": 30,
+  "next_pull_max_sec": 86400,
+  "ws_enabled": true,
+  "ws_debug": 1,
+  "debug": 1,
+  "http_retry_count": 2,
+  "http_retry_backoff_ms": 1200,
+  "features": {
+    "allow_snapshot": true
+  },
+  "battery": {
+    "adc_pin": null,
+    "divider_ratio": 2.0,
+    "vref": 3.3,
+    "samples": 4,
+    "empty_v": 3.3,
+    "full_v": 4.2,
+    "low_hysteresis_v": 0.05
+  },
+  "gps": {
+    "mode": "static_config",
+    "allow_static": true,
+    "include_source": true
+  },
+  "gpio": {
+    "mode": "servo",
+    "servo_pwm_pin": 20,
+    "servo_freq": 50,
+    "servo_open_us": 2300,
+    "servo_close_us": 700,
+    "servo_drive_ms": 500,
+    "sensor_pin": 15,
+    "sensor_open_is": 1,
+    "sensor_pull": "down",
+    "sensor_debounce_ms": 60
+  },
+  "thresholds": {
+    "low_battery_v": 3.3
+  },
+  "runtime": {
+    "max_command_queue": 32,
+    "loop_sleep_ms": 100,
+    "loop_error_backoff_ms": 500,
+    "ws_pull_max": 10,
+    "journal_pull_max": 10,
+    "legacy_import_batch": 0,
+    "outbox_flush_max": 5,
+    "offline_after_heartbeat_failures": 3,
+    "healthcheck_on_startup": true,
+    "healthcheck_timeout_fail_open": true,
+    "journal_state_save_every": 1,
+    "journal_compact_min_bytes": 4096,
+    "journal_compact_ratio_pct": 50,
+    "journal_enabled": true,
+    "persist_ws_commands": false,
+    "power_profile": "balanced",
+    "processed_id_cache_size": 128,
+    "ws_reconnect_delay_ms": 5000,
+    "ws_idle_timeout_ms": 90000,
+    "ws_confirm_timeout_ms": 12000,
+    "tamper_repeat_suppress_ms": 15000
+  },
+  "files": {
+    "token": "token.json",
+    "outbox": "outbox.jsonl",
+    "outbox_state": "outbox_state.json",
+    "commands_journal": "commands_queue.jsonl",
+    "commands_state": "commands_state.json",
+    "commands_dead_letter": "commands_dead.jsonl",
+    "commands_legacy_inbox": "commands_inbox"
+  }
+}
