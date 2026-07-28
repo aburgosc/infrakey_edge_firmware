@@ -20,10 +20,23 @@ class InfrakeyClient:
     def __init__(self, cfg: dict, debug=1):
         self.cfg = cfg
         self.debug = debug
-        self.hal = make_hal(debug=debug)
+        hw = cfg.get("hardware", {})
+        self.hal = make_hal(
+            debug=debug,
+            uart_port=hw.get("uart_port", 0),
+            baud=hw.get("baud", 115200),
+            led_pin=hw.get("led_pin", 25),
+            pwr_en_pin=hw.get("pwr_en_pin", 14),
+            uart_tx_pin=hw.get("uart_tx_pin"),
+            uart_rx_pin=hw.get("uart_rx_pin"),
+        )
         self.modem = SIM7080(self.hal, nb_band=cfg["nb_band"], tls_ctx=0, sock_id=0, debug=debug)
         self.http = HttpClient(
-            self.modem, host=cfg["host"], port=cfg["port"], user_agent=cfg["user_agent"]
+            self.modem,
+            host=cfg["host"],
+            port=cfg["port"],
+            user_agent=cfg["user_agent"],
+            connect_host=cfg.get("connect_host"),
         )
         self.token_file = cfg["files"]["token"]
         self.model = cfg["model"]
@@ -44,6 +57,10 @@ class InfrakeyClient:
             "last_heartbeat_status": None,
             "last_heartbeat_ok": None,
             "last_heartbeat_next_pull_sec": None,
+        }
+        self._gps_cache = {
+            "at_ms": None,
+            "payload": None,
         }
 
     def _log(self, *args):
@@ -104,11 +121,82 @@ class InfrakeyClient:
         if not self.modem.start():
             self._log("No arranca el modem")
             return False
+        gps_cfg = self.cfg.get("gps", {})
+        gps_mode = gps_cfg.get("mode", "static_config")
+        power_on_startup = bool(gps_cfg.get("power_on_startup", True))
+        power_down_after_read = bool(gps_cfg.get("power_down_after_read", True))
+        if gps_mode in ("modem_gnss", "prefer_modem") and power_on_startup and not power_down_after_read:
+            try:
+                self.modem.ensure_gnss_power(True)
+            except Exception:
+                pass
         self.modem.set_radio_nbiot()
+        if gps_mode in ("modem_gnss", "prefer_modem"):
+            try:
+                location = self.resolve_location(force=True)
+                if self.debug and location:
+                    self._log("[gps] cache primed before network:", location)
+            except Exception:
+                pass
         if not self.modem.attach_and_pdp(fallback_apn=self.cfg["apn_fallback"]):
             self._log("No fue posible adjuntar PDP/red")
             return False
         return True
+
+    def resolve_location(self, force=False):
+        gps_cfg = self.cfg.get("gps", {})
+        gps_mode = gps_cfg.get("mode", "static_config")
+        allow_static = bool(gps_cfg.get("allow_static", True))
+        include_source = bool(gps_cfg.get("include_source", True))
+
+        if not force:
+            try:
+                cache_ms = max(0, _safe_int(gps_cfg.get("cache_ms", 15000), 15000))
+                cached_at = self._gps_cache.get("at_ms")
+                if cached_at is not None and self.hal.ticks_diff(self.hal.ticks_ms(), cached_at) < cache_ms:
+                    cached_payload = self._gps_cache.get("payload")
+                    if isinstance(cached_payload, dict):
+                        return dict(cached_payload)
+            except Exception:
+                pass
+
+        payload = {}
+        if gps_mode in ("modem_gnss", "prefer_modem"):
+            power_down_after_read = bool(gps_cfg.get("power_down_after_read", True))
+            try:
+                info = self.modem.read_gnss_location(
+                    ensure_power=True,
+                    attempts=max(1, _safe_int(gps_cfg.get("poll_attempts", 2), 2)),
+                    delay_ms=max(0, _safe_int(gps_cfg.get("poll_interval_ms", 1000), 1000)),
+                )
+            except Exception:
+                info = None
+            finally:
+                if power_down_after_read:
+                    try:
+                        self.modem.ensure_gnss_power(False)
+                    except Exception:
+                        pass
+            if isinstance(info, dict):
+                lat = info.get("latitude")
+                lon = info.get("longitude")
+                if lat is not None and lon is not None:
+                    payload["latitude"] = lat
+                    payload["longitude"] = lon
+                    if include_source:
+                        payload["gps_source"] = "modem_gnss"
+
+        if not payload and allow_static:
+            if self.latitude is not None:
+                payload["latitude"] = self.latitude
+            if self.longitude is not None:
+                payload["longitude"] = self.longitude
+            if ("latitude" in payload or "longitude" in payload) and include_source:
+                payload["gps_source"] = "static_config"
+
+        self._gps_cache["at_ms"] = self.hal.ticks_ms()
+        self._gps_cache["payload"] = dict(payload)
+        return payload
 
     def _valid_identity(self, imei, iccid):
         if not imei or not iccid:
@@ -186,9 +274,12 @@ class InfrakeyClient:
             "iccid": iccid,
             "model": self.model,
             "fw": self.fw,
-            "latitude": self.latitude,
-            "longitude": self.longitude,
         }
+        location = self.resolve_location(force=False)
+        if "latitude" in location:
+            body["latitude"] = location["latitude"]
+        if "longitude" in location:
+            body["longitude"] = location["longitude"]
         status, obj, dbg = self._request_with_retry(
             lambda: self.http.post_json("/api/v1/devices/claim", body),
             "claim",
@@ -215,10 +306,12 @@ class InfrakeyClient:
             "lte": "OK",
             "fw": self.fw,
         }
-        if latitude is None:
-            latitude = self.latitude
-        if longitude is None:
-            longitude = self.longitude
+        if latitude is None or longitude is None:
+            location = self.resolve_location(force=False)
+            if latitude is None:
+                latitude = location.get("latitude")
+            if longitude is None:
+                longitude = location.get("longitude")
         if latitude is not None:
             body["latitude"] = latitude
         if longitude is not None:

@@ -1,4 +1,4 @@
-﻿# hal.py
+# hal.py
 # Abstraccion de hardware: mismo API para hardware real y mock.
 
 try:
@@ -152,11 +152,22 @@ class HardwareHAL:
     HAL para Raspberry Pi Pico (MicroPython + machine).
     Maneja UART, pines, y lectura AT+CARECV exacta.
     """
-    def __init__(self, uart_port=0, baud=115200, led_pin=25, pwr_en_pin=14, debug=1):
+    def __init__(self, uart_port=0, baud=115200, led_pin=25, pwr_en_pin=14, uart_tx_pin=None, uart_rx_pin=None, debug=1):
         import machine
         self.debug = debug
         self._machine = machine
-        self.uart = machine.UART(uart_port, baud)
+        uart_kwargs = {}
+        try:
+            if uart_tx_pin is not None:
+                uart_kwargs["tx"] = machine.Pin(int(uart_tx_pin))
+            if uart_rx_pin is not None:
+                uart_kwargs["rx"] = machine.Pin(int(uart_rx_pin))
+        except Exception:
+            uart_kwargs = {}
+        try:
+            self.uart = machine.UART(uart_port, baud, **uart_kwargs)
+        except TypeError:
+            self.uart = machine.UART(uart_port, baud)
         self.led = machine.Pin(led_pin, machine.Pin.OUT)
         self.pwr_en_pin = pwr_en_pin
         self.current_sock_id = 0
@@ -227,10 +238,20 @@ class HardwareHAL:
     # AT
     def send_at(self, cmd, expect="OK", timeout=1500, dump=False):
         cmd_to_send = cmd if str(cmd).startswith("AT") else ("AT" + str(cmd))
+
+        # Descarta terminadores pendientes de la respuesta anterior. Esto
+        # permite finalizar temprano sin confundir un OK antiguo con el
+        # comando que se enviara a continuacion.
+        drain_t0 = _tm.ticks_ms()
+        while _tm.ticks_diff(_tm.ticks_ms(), drain_t0) < 30:
+            if not self.uart_read_some(256):
+                _tm.sleep_ms(5)
+
         if self.debug >= 1: print(">>", cmd_to_send)
         self.uart.write((cmd_to_send + "\r\n").encode())
 
-        buf = b""; t0 = _tm.ticks_ms()
+        buf = b""; t0 = _tm.ticks_ms(); matched_at = None
+        expected = expect.encode() if isinstance(expect, str) else expect
         while _tm.ticks_diff(_tm.ticks_ms(), t0) < timeout:
             chunk = self.uart_read_some(256)
             if chunk:
@@ -238,7 +259,21 @@ class HardwareHAL:
                 if dump and self.debug >= 2:
                     try: print(chunk.decode("utf-8","ignore"), end="")
                     except Exception: pass
-            else:
+
+                if matched_at is None:
+                    if expect is None:
+                        if b"\r\nOK\r\n" in buf or b"ERROR" in buf:
+                            matched_at = _tm.ticks_ms()
+                    elif (expected and expected in buf) or b"ERROR" in buf:
+                        matched_at = _tm.ticks_ms()
+
+            if matched_at is not None:
+                # Breve gracia para capturar el OK posterior a respuestas
+                # intermedias como +CPIN: READY.
+                if _tm.ticks_diff(_tm.ticks_ms(), matched_at) >= 50:
+                    break
+                _tm.sleep_ms(5)
+            elif not chunk:
                 _tm.sleep_ms(10)
 
         resp = buf.decode("utf-8","ignore") if buf else ""
@@ -379,12 +414,20 @@ class HardwareHAL:
     def sleep_ms(self, ms): _tm.sleep_ms(ms)
 
 # =============== Factory ===============
-def make_hal(debug=1, uart_port=0, baud=115200, led_pin=25, pwr_en_pin=14):
+def make_hal(debug=1, uart_port=0, baud=115200, led_pin=25, pwr_en_pin=14, uart_tx_pin=None, uart_rx_pin=None):
     use_mock = _getenv("SIM7080_USE_MOCK", None)
     if use_mock == "1": return MockHAL(debug=debug)
     try:
         import machine  # noqa: F401
-        return HardwareHAL(uart_port=uart_port, baud=baud, led_pin=led_pin, pwr_en_pin=pwr_en_pin, debug=debug)
+        return HardwareHAL(
+            uart_port=uart_port,
+            baud=baud,
+            led_pin=led_pin,
+            pwr_en_pin=pwr_en_pin,
+            uart_tx_pin=uart_tx_pin,
+            uart_rx_pin=uart_rx_pin,
+            debug=debug,
+        )
     except Exception:
         return MockHAL(debug=debug)
 

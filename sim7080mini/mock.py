@@ -36,6 +36,10 @@ class SIM7080Modem:
         self._tx = bytearray()
         self._rx = bytearray()
 
+    def _reset_buffers(self):
+        del self._rx[:]
+        del self._tx[:]
+
     def _log(self, *a):
         if self.debug >= 1:
             print(*a)
@@ -76,7 +80,7 @@ class SIM7080Modem:
             st = 1 if self.sock_open else 0
             resp_lines += [f"+CASTATE: {self.SOCK_ID},{st}", "OK"]
         elif c.startswith("AT+CACLOSE="):
-            self.sock_open=False; self._rx.clear(); self._tx.clear()
+            self.sock_open=False; self._reset_buffers()
             resp_lines += [f"+CACLOSE: {self.SOCK_ID},0", "OK"]
         elif c.startswith("AT+CASEND="):
             resp_lines.append("> " if self.sock_open else "ERROR")
@@ -155,7 +159,7 @@ class SIM7080Modem:
         return True
 
     def socket_close(self):
-        self.sock_open=False; self._rx.clear(); self._tx.clear()
+        self.sock_open=False; self._reset_buffers()
 
     def socket_send(self, payload, wait_ok_ms=8000):
         if not self.sock_open: return False
@@ -175,7 +179,7 @@ class SIM7080Modem:
     def write_at_only(self, data):
         return True
 
-    def http_post_json_return(self, host, port, user_agent, path, body_dict, extra_headers=None):
+    def http_post_json_return(self, host, port, user_agent, path, body_dict, extra_headers=None, connect_host=None):
         req = "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\n\r\n{}".format(
             path,
             host,
@@ -185,7 +189,7 @@ class SIM7080Modem:
         reply = self._http_reply_for_request(req)
         return self._parse_http_reply(reply)
 
-    def http_get_json_return(self, host, port, user_agent, path, extra_headers=None):
+    def http_get_json_return(self, host, port, user_agent, path, extra_headers=None, connect_host=None):
         req = "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\n\r\n".format(
             path,
             host,
@@ -210,6 +214,22 @@ class SIM7080Modem:
 
     def get_imei(self): return "359123456789012"
     def get_iccid(self): return "8940012345678901234"
+    def ensure_gnss_power(self, enabled=True): return True
+    def read_gnss_info(self):
+        return {
+            "run_status": 1,
+            "fix_status": 1,
+            "utc": "2026-07-28T12:00:00Z",
+            "latitude": -33.4489,
+            "longitude": -70.6693,
+            "altitude": 520.0,
+            "speed": 0.0,
+            "course": 0.0,
+            "satellites": 8,
+            "raw": "+CGNSINF: mock",
+        }
+    def read_gnss_location(self, ensure_power=True, attempts=1, delay_ms=1000):
+        return self.read_gnss_info()
 
     def _parse_csv(self, s):
         parts=[]; cur=""; inq=False

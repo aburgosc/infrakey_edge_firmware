@@ -220,6 +220,26 @@ Solo correrlo si el backend real lo soporta o si se quiere validar extensión in
 - `ACK` WS si aplica
 - efecto visible
 
+### Validación de apertura autorizada y forzada
+
+1. Ejecutar `exec(open("probe_sensor.py").read())` en la Pico y aplicar al
+   JSON la polaridad recomendada para `sensor_open_is` y `sensor_pull`.
+2. Con la puerta cerrada, enviar `open_actuator` y abrirla dentro de
+   `sensor_authorized_open_ms`.
+3. Confirmar el movimiento, `device_opened` y ausencia de `tamper_alert` y
+   `unauthorized_access`.
+4. Cerrar físicamente la puerta sin enviar una nueva orden.
+5. Abrirla físicamente y confirmar ambos eventos de seguridad con el mismo
+   `security_event_id`.
+6. Repetir una apertura después de dejar vencer
+   `sensor_authorized_open_ms`; debe clasificarse como no autorizada.
+7. Reiniciar con el contacto abierto y confirmar una sola alerta con motivo
+   `door_open_on_boot`.
+8. Reiniciar abierto, cerrar dentro de `sensor_boot_grace_ms` y confirmar que
+   no se genera un falso positivo.
+9. Repetir sin cobertura y confirmar que los eventos quedan en `outbox.jsonl`
+   y se entregan al recuperar la red.
+
 ### Aprobación
 
 - ejecución o rechazo coherente

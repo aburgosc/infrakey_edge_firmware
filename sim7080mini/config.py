@@ -33,7 +33,10 @@ def _safe_remove(path):
 
 DEFAULT = {
     "host": "api.infrakey.fasttrack.cloud",
+    "connect_host": None,
     "port": 443,
+    "ws_host": None,
+    "ws_connect_host": None,
     "nb_band": 28,
     "apn_fallback": "m2m.entel.cl",
     "user_agent": "pico-sim7080g/caopen-infrakey-1.3",
@@ -91,6 +94,19 @@ DEFAULT = {
         "mode": "static_config",
         "allow_static": True,
         "include_source": True,
+        "power_on_startup": True,
+        "power_down_after_read": True,
+        "poll_attempts": 2,
+        "poll_interval_ms": 1000,
+        "cache_ms": 15000,
+    },
+    "hardware": {
+        "uart_port": 0,
+        "baud": 115200,
+        "led_pin": 25,
+        "pwr_en_pin": 14,
+        "uart_tx_pin": None,
+        "uart_rx_pin": None,
     },
     # GPIO
     "gpio": {
@@ -106,6 +122,9 @@ DEFAULT = {
         "sensor_open_is": 1,
         "sensor_pull": "down",
         "sensor_debounce_ms": 60,
+        "sensor_authorized_open_ms": 8000,
+        "sensor_alert_if_open_on_boot": True,
+        "sensor_boot_grace_ms": 1000,
         "tamper_pin": 15,
         "tamper_pull": "up",
         "tamper_active_high": True,
@@ -139,7 +158,10 @@ def load_config(path="device_config.json"):
 def _persistable_config(cfg):
     data = {
         "host": cfg.get("host"),
+        "connect_host": cfg.get("connect_host"),
         "port": cfg.get("port"),
+        "ws_host": cfg.get("ws_host"),
+        "ws_connect_host": cfg.get("ws_connect_host"),
         "nb_band": cfg.get("nb_band"),
         "apn_fallback": cfg.get("apn_fallback"),
         "user_agent": cfg.get("user_agent"),
@@ -157,6 +179,7 @@ def _persistable_config(cfg):
         "features": _deep_copy(cfg.get("features", {})),
         "battery": _deep_copy(cfg.get("battery", {})),
         "gps": _deep_copy(cfg.get("gps", {})),
+        "hardware": _deep_copy(cfg.get("hardware", {})),
         "gpio": _deep_copy(cfg.get("gpio", {})),
         "thresholds": _deep_copy(cfg.get("thresholds", {})),
         "files": _deep_copy(cfg.get("files", {})),

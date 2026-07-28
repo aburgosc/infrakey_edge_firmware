@@ -118,6 +118,22 @@ El canal en tiempo real usa:
 - `device_offline`
 - `unauthorized_access`
 
+### Sensor de apertura y seguridad
+
+El contacto de puerta se conecta a `gpio.sensor_pin`. El firmware aplica
+debounce y distingue el origen de cada apertura:
+
+- `open_actuator` habilita una sola apertura durante
+  `sensor_authorized_open_ms`; esa transición no genera alarma.
+- El cierre físico consume cualquier permiso pendiente.
+- Una apertura posterior sin una orden vigente genera `tamper_alert` y
+  `unauthorized_access`. Si no hay red, ambos eventos quedan en el outbox.
+- Si el equipo arranca con la puerta abierta, genera una alerta después de
+  `sensor_boot_grace_ms` cuando `sensor_alert_if_open_on_boot` está activo.
+
+La polaridad real debe comprobarse en la placa con `probe_sensor.py`. Los
+valores `sensor_open_is` y `sensor_pull` no deben asumirse sin esa medición.
+
 ## Arquitectura de comandos
 
 El producto usa una arquitectura `RAM + JSONL`:
@@ -174,6 +190,11 @@ Campos importantes:
 - `gps`
 - `runtime`
 - `files`
+
+Los parámetros de seguridad del sensor están dentro de `gpio`:
+`sensor_pin`, `sensor_open_is`, `sensor_pull`, `sensor_debounce_ms`,
+`sensor_authorized_open_ms`, `sensor_alert_if_open_on_boot` y
+`sensor_boot_grace_ms`.
 
 Ejemplo de perfil de terreno:
 

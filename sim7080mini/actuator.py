@@ -1,4 +1,4 @@
-﻿# sim7080mini/actuator.py
+# sim7080mini/actuator.py
 # Control de actuador:
 # - Modo "relay": 1 pin (pulso) o 2 pines (open/close).
 # - Modo "servo": PWM 50Hz (open_us / close_us), con drive_ms para soltar pulso.
@@ -29,9 +29,11 @@ def _ticks_diff(a, b):
 class _EdgeDebouncer:
     def __init__(self, read_fn, debounce_ms=60):
         self._read = read_fn
-        self._db = int(debounce_ms)
-        self._last = self._read()
-        self._t_last = _ticks_ms()
+        self._db = max(0, int(debounce_ms))
+        initial = 1 if self._read() else 0
+        self._stable = initial
+        self._candidate = initial
+        self._candidate_since = _ticks_ms()
 
     def edge(self):
         """
@@ -39,14 +41,19 @@ class _EdgeDebouncer:
         """
         now = _ticks_ms()
         v = 1 if self._read() else 0
-        if v != self._last and _ticks_diff(now, self._t_last) >= self._db:
-            self._last = v
-            self._t_last = now
-            return True, v
+        if v != self._candidate:
+            self._candidate = v
+            self._candidate_since = now
+            if self._db > 0:
+                return False, None
+        if self._candidate != self._stable:
+            if _ticks_diff(now, self._candidate_since) >= self._db:
+                self._stable = self._candidate
+                return True, self._stable
         return False, None
 
     def value(self):
-        return 1 if self._read() else 0
+        return self._stable
 
 
 class _ServoDriver:
@@ -162,6 +169,19 @@ class Actuator:
         self.cfg = gpio_cfg or {}
         self._mode = self.cfg.get("mode", None)  # "relay" | "servo" | None(auto)
         self._last_cmd = "close"
+        self._authorized_open_at_ms = None
+        self._authorized_open_window_ms = max(
+            0,
+            int(self.cfg.get("sensor_authorized_open_ms", 8000)),
+        )
+        self._boot_at_ms = _ticks_ms()
+        self._boot_grace_ms = max(0, int(self.cfg.get("sensor_boot_grace_ms", 1000)))
+        self._alert_if_open_on_boot = bool(
+            self.cfg.get("sensor_alert_if_open_on_boot", True)
+        )
+        self._boot_open_pending = False
+        self._last_tamper_reason = None
+        self._tamper_replay_pending = False
 
         # --- Detectar modo ---
         use_servo = False
@@ -209,6 +229,9 @@ class Actuator:
             db = int(self.cfg.get("sensor_debounce_ms", 60))
             self._sensor = hal.pin_in(pin, pull=pull)
             self._sensor_db = _EdgeDebouncer(self._sensor.read, debounce_ms=db)
+            self._boot_open_pending = bool(
+                self._alert_if_open_on_boot and self.is_open()
+            )
         else:
             # Compat: tamper pin (booleano activo alto/bajo)
             self._tamper = hal.pin_in(self.cfg["tamper_pin"], pull=self.cfg.get("tamper_pull", "up"))
@@ -221,21 +244,79 @@ class Actuator:
         pinobj.off()
 
     # ------------- API publica -------------
+    def _sensor_raw_is_open(self):
+        if not self._has_sensor:
+            return False
+        try:
+            value = 1 if self._sensor.read() else 0
+            return value == self._sensor_open_is
+        except Exception:
+            return False
+
+    def _clear_open_authorization(self):
+        self._authorized_open_at_ms = None
+
+    def _arm_open_authorization(self):
+        if not self._has_sensor:
+            return False
+        # Una orden remota no debe autorizar retrospectivamente una puerta
+        # que ya estaba abierta antes de ejecutar el actuador.
+        if self._sensor_raw_is_open():
+            self._clear_open_authorization()
+            return False
+        self._authorized_open_at_ms = _ticks_ms()
+        return True
+
+    def _consume_open_authorization(self, now_ms):
+        armed_at = self._authorized_open_at_ms
+        if armed_at is None:
+            return False
+        age_ms = _ticks_diff(now_ms, armed_at)
+        self._clear_open_authorization()
+        return 0 <= age_ms <= self._authorized_open_window_ms
+
+    def wait_for_authorized_open(self, poll_ms=25):
+        """
+        Observa el sensor durante la ventana autorizada antes de iniciar I/O de red.
+
+        Devuelve True si se confirmo el flanco, False si vencio sin apertura y
+        None cuando no hay sensor o la orden no pudo armar una autorizacion.
+        """
+        if not self._has_sensor or self._authorized_open_at_ms is None:
+            return None
+        poll_ms = max(5, int(poll_ms))
+        while self._authorized_open_at_ms is not None:
+            if self.tamper_triggered():
+                # El handler aun debe publicar este flanco como evento.
+                self._tamper_replay_pending = True
+                return False
+            if self._authorized_open_at_ms is None:
+                return bool(self.is_open())
+            self.hal.sleep_ms(poll_ms)
+        return False
+
     def open(self):
-        if self._is_relay:
-            if getattr(self, "_single", False):
-                self._pulse(self._pin, self._pulse_ms)
+        armed = self._arm_open_authorization()
+        try:
+            if self._is_relay:
+                if getattr(self, "_single", False):
+                    self._pulse(self._pin, self._pulse_ms)
+                else:
+                    self._pulse(self._open_pin, self._pulse_ms)
             else:
-                self._pulse(self._open_pin, self._pulse_ms)
-        else:
-            # Servo
-            self._servo.pulse_us(self._sv_open_us)
-            if self._sv_drive_ms > 0:
-                self.hal.sleep_ms(self._sv_drive_ms)
-                self._servo.idle()
+                # Servo
+                self._servo.pulse_us(self._sv_open_us)
+                if self._sv_drive_ms > 0:
+                    self.hal.sleep_ms(self._sv_drive_ms)
+                    self._servo.idle()
+        except Exception:
+            if armed:
+                self._clear_open_authorization()
+            raise
         self._last_cmd = "open"
 
     def close(self):
+        self._clear_open_authorization()
         if self._is_relay:
             if getattr(self, "_single", False):
                 self._pulse(self._pin, self._pulse_ms)
@@ -251,16 +332,26 @@ class Actuator:
 
     def pulse(self, ms=500):
         ms = int(ms)
-        if self._is_relay:
-            pulse_ms = ms if ms > 0 else self._pulse_ms
-            if getattr(self, "_single", False):
-                self._pulse(self._pin, pulse_ms)
+        armed = self._arm_open_authorization()
+        try:
+            if self._is_relay:
+                pulse_ms = ms if ms > 0 else self._pulse_ms
+                if getattr(self, "_single", False):
+                    self._pulse(self._pin, pulse_ms)
+                else:
+                    self._pulse(self._open_pin, pulse_ms)
             else:
-                self._pulse(self._open_pin, pulse_ms)
-        else:
-            self.open()
-            self.hal.sleep_ms(ms if ms > 0 else self._sv_drive_ms)
-            self.close()
+                self._servo.pulse_us(self._sv_open_us)
+                self.hal.sleep_ms(ms if ms > 0 else self._sv_drive_ms)
+                self._servo.pulse_us(self._sv_close_us)
+                if self._sv_drive_ms > 0:
+                    self.hal.sleep_ms(self._sv_drive_ms)
+                self._servo.idle()
+        except Exception:
+            if armed:
+                self._clear_open_authorization()
+            raise
+        self._last_cmd = "close"
 
     # Estado abierto/cerrado solo si hay sensor explicito
     def is_open(self):
@@ -272,21 +363,53 @@ class Actuator:
     def tamper_triggered(self) -> bool:
         """
         Modo sensor:
-          True si el sensor cambio a ABIERTO y el ultimo comando NO fue 'open' (apertura forzada).
+          True ante apertura sin autorizacion vigente o si arranca abierto.
         Modo tamper compat:
           Lee el pin tamper con activo alto/bajo.
         """
         if self._has_sensor:
-            changed, new_val = self._sensor_db.edge()
-            if not changed or new_val is None:
-                return False
-            opened = (new_val == self._sensor_open_is)
-            if opened and self._last_cmd != "open":
+            if self._tamper_replay_pending:
+                self._tamper_replay_pending = False
                 return True
+            now_ms = _ticks_ms()
+            armed_at = self._authorized_open_at_ms
+            if armed_at is not None:
+                age_ms = _ticks_diff(now_ms, armed_at)
+                if age_ms < 0 or age_ms > self._authorized_open_window_ms:
+                    self._clear_open_authorization()
+
+            changed, new_val = self._sensor_db.edge()
+            if changed and new_val is not None:
+                opened = (new_val == self._sensor_open_is)
+                if opened:
+                    if self._consume_open_authorization(now_ms):
+                        self._last_tamper_reason = None
+                        return False
+                    self._last_tamper_reason = "door_forced"
+                    self._boot_open_pending = False
+                    return True
+                # El cierre cancela cualquier permiso que no haya sido usado.
+                self._clear_open_authorization()
+                self._boot_open_pending = False
+
+            if (
+                self._boot_open_pending
+                and _ticks_diff(now_ms, self._boot_at_ms) >= self._boot_grace_ms
+            ):
+                self._boot_open_pending = False
+                if self._sensor_raw_is_open():
+                    self._last_tamper_reason = "door_open_on_boot"
+                    return True
             return False
         else:
             val = 1 if self._tamper.read() else 0
-            return bool(val) if self._tamper_active_high else not bool(val)
+            triggered = bool(val) if self._tamper_active_high else not bool(val)
+            if triggered:
+                self._last_tamper_reason = "tamper_level"
+            return triggered
+
+    def last_tamper_reason(self):
+        return self._last_tamper_reason
 
     def deinit(self):
         if not self._is_relay:

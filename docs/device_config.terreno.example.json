@@ -1,13 +1,16 @@
 {
   "host": "api.infrakey.fasttrack.cloud",
+  "connect_host": null,
   "port": 443,
+  "ws_host": "infrakey.fasttrack.cloud",
+  "ws_connect_host": null,
   "nb_band": 28,
   "apn_fallback": "m2m.entel.cl",
   "user_agent": "pico-sim7080g/caopen-infrakey-1.3",
   "fw": "v1.0.0",
   "model": "Raspberry-Pi-G4",
-  "latitude": -33.4489,
-  "longitude": -70.6693,
+  "latitude": null,
+  "longitude": null,
   "heartbeat_interval_sec": 900,
   "heartbeat_interval_min_sec": 60,
   "heartbeat_interval_max_sec": 86400,
@@ -31,9 +34,14 @@
     "low_hysteresis_v": 0.05
   },
   "gps": {
-    "mode": "static_config",
-    "allow_static": true,
-    "include_source": true
+    "mode": "modem_gnss",
+    "allow_static": false,
+    "include_source": true,
+    "power_on_startup": true,
+    "power_down_after_read": true,
+    "poll_attempts": 2,
+    "poll_interval_ms": 1000,
+    "cache_ms": 900000
   },
   "gpio": {
     "mode": "servo",
@@ -45,15 +53,18 @@
     "sensor_pin": 15,
     "sensor_open_is": 1,
     "sensor_pull": "down",
-    "sensor_debounce_ms": 60
+    "sensor_debounce_ms": 60,
+    "sensor_authorized_open_ms": 8000,
+    "sensor_alert_if_open_on_boot": true,
+    "sensor_boot_grace_ms": 1000
   },
   "thresholds": {
     "low_battery_v": 3.3
   },
   "runtime": {
     "max_command_queue": 32,
-    "loop_sleep_ms": 100,
-    "loop_error_backoff_ms": 500,
+    "loop_sleep_ms": 250,
+    "loop_error_backoff_ms": 1000,
     "ws_pull_max": 10,
     "journal_pull_max": 10,
     "legacy_import_batch": 0,
@@ -68,9 +79,11 @@
     "persist_ws_commands": false,
     "power_profile": "balanced",
     "processed_id_cache_size": 128,
-    "ws_reconnect_delay_ms": 5000,
+    "ws_reconnect_delay_ms": 15000,
     "ws_idle_timeout_ms": 90000,
-    "ws_confirm_timeout_ms": 12000,
+    "ws_confirm_timeout_ms": 25000,
+    "ws_identifier_include_device_id": false,
+    "ws_token_in_query": true,
     "tamper_repeat_suppress_ms": 15000
   },
   "files": {
@@ -81,5 +94,13 @@
     "commands_state": "commands_state.json",
     "commands_dead_letter": "commands_dead.jsonl",
     "commands_legacy_inbox": "commands_inbox"
+  },
+  "hardware": {
+    "uart_port": 0,
+    "baud": 115200,
+    "led_pin": 25,
+    "pwr_en_pin": 14,
+    "uart_tx_pin": 0,
+    "uart_rx_pin": 1
   }
 }

@@ -54,7 +54,10 @@ def _safe_next_sleep(cfg, obj, fallback):
 def _make_ws(client, cfg, token, device_id, debug):
     ws_debug = cfg.get("ws_debug", debug)
     ws_host = cfg.get("ws_host", cfg["host"])
+    if not ws_host:
+        ws_host = cfg["host"]
     ws_port = cfg.get("ws_port", cfg["port"])
+    ws_connect_host = cfg.get("ws_connect_host", cfg.get("connect_host"))
     runtime = cfg.get("runtime", {})
     ws_max_queue = runtime.get("ws_queue_max", runtime.get("max_command_queue", 32))
     identifier_extra = {}
@@ -72,6 +75,7 @@ def _make_ws(client, cfg, token, device_id, debug):
         sock_id=1,
         max_queue=ws_max_queue,
         token_in_query=runtime.get("ws_token_in_query", False),
+        connect_host=ws_connect_host,
     )
 
 
@@ -129,6 +133,14 @@ def main():
 
     print("[claim] ok device_id=", device_id)
 
+    battery_v, battery_pct = _read_battery_metrics(client)
+    st, obj, dbg = client.heartbeat(device_id, token, battery_v=battery_v, battery_pct=battery_pct)
+    device_id, token = client.current_credentials(device_id, token)
+    client.note_heartbeat_status(st, flush_device_id=device_id, flush_token=token)
+
+    next_sleep = _safe_next_sleep(cfg, obj, cfg.get("heartbeat_interval_sec", 86400))
+    print("[heartbeat] startup status=", st, "next_pull_sec=", next_sleep)
+    last_hb_ms = client.hal.ticks_ms()
     ws = None
     last_ws_attempt_ms = 0
     ws_reconnect_delay_ms = _bounded_sleep(runtime.get("ws_reconnect_delay_ms", 5000), 5000)
@@ -157,14 +169,6 @@ def main():
             bool(runtime.get("persist_ws_commands", False)),
         )
 
-    battery_v, battery_pct = _read_battery_metrics(client)
-    st, obj, dbg = client.heartbeat(device_id, token, battery_v=battery_v, battery_pct=battery_pct)
-    device_id, token = client.current_credentials(device_id, token)
-    client.note_heartbeat_status(st, flush_device_id=device_id, flush_token=token)
-
-    next_sleep = _safe_next_sleep(cfg, obj, cfg.get("heartbeat_interval_sec", 86400))
-    print("[heartbeat] startup status=", st, "next_pull_sec=", next_sleep)
-    last_hb_ms = client.hal.ticks_ms()
     loop_sleep_ms = _bounded_sleep(runtime.get("loop_sleep_ms", 100), 100)
     loop_error_backoff_ms = _bounded_sleep(runtime.get("loop_error_backoff_ms", 500), 500)
     legacy_import_batch = max(0, _bounded_sleep(runtime.get("legacy_import_batch", 1), 1))

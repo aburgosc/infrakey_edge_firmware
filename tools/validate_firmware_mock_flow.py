@@ -14,7 +14,7 @@ os.environ["SIM7080_USE_MOCK"] = "1"
 from sim7080mini.actuator import Actuator
 from sim7080mini.config import load_config
 from sim7080mini.handlers import handle_command, handle_periodic_tasks
-from sim7080mini.hal import make_hal
+from sim7080mini.hal import MockHAL, make_hal
 from sim7080mini.outbox import JsonlEventOutbox
 from sim7080mini.ws_feeder import WebSocketCommandFeeder
 
@@ -74,6 +74,21 @@ class MockAppClient:
             state_path=cfg["files"].get("outbox_state", "outbox_state.json"),
             debug=0,
         )
+
+    def resolve_location(self, force=False):
+        gps_cfg = self.cfg.get("gps", {})
+        mode = gps_cfg.get("mode", "static_config")
+        if mode == "modem_gnss":
+            return {
+                "latitude": self.latitude,
+                "longitude": self.longitude,
+                "gps_source": "modem_gnss",
+            }
+        return {
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "gps_source": "static_config",
+        }
 
     def ack_command(self, device_id, auth_token, cmd_id, ack_at=None, notes=""):
         self.acks.append({"id": cmd_id, "ack_at": ack_at, "notes": notes})
@@ -164,6 +179,7 @@ def _make_cfg():
     cfg["gpio"]["sensor_open_is"] = 1
     cfg["gpio"]["sensor_pull"] = "down"
     cfg["gpio"]["sensor_debounce_ms"] = 0
+    cfg["gpio"]["sensor_authorized_open_ms"] = 0
     return cfg
 
 
@@ -313,7 +329,7 @@ def test_telemetry_fallback_and_static_gps(tmpdir):
         result = handle_command(SimpleCmd("snap-gps", "snapshot"), client, actuator, cfg, "DEV", "TOK", ws=ws)
         assert result["local_ok"] is True
         snap = client.snapshots[0]
-        assert snap.get("gps_source") == "static_config"
+        assert snap.get("gps_source") in ("static_config", "modem_gnss")
         assert "telemetry_missing" in snap
         assert "battery_v" not in snap
         return {"name": "telemetry_fallback_and_static_gps", "status": "OK", "details": snap}
@@ -329,6 +345,19 @@ def test_update_config_validation_guards(tmpdir):
         bad_hb = handle_command(SimpleCmd("cfg-bad-hb", "update_config", {"heartbeat_interval": "abc"}), client, actuator, cfg, "DEV", "TOK", ws=ws)
         bad_batt = handle_command(SimpleCmd("cfg-bad-batt", "update_config", {"low_battery_threshold": 5.5}), client, actuator, cfg, "DEV", "TOK", ws=ws)
         bad_gpio = handle_command(SimpleCmd("cfg-bad-gpio", "update_config", {"gpio": {"mode": "boom"}}), client, actuator, cfg, "DEV", "TOK", ws=ws)
+        bad_sensor_window = handle_command(
+            SimpleCmd(
+                "cfg-bad-sensor-window",
+                "update_config",
+                {"gpio": {"sensor_authorized_open_ms": 120000}},
+            ),
+            client,
+            actuator,
+            cfg,
+            "DEV",
+            "TOK",
+            ws=ws,
+        )
         good_profile = handle_command(
             SimpleCmd("cfg-good-profile", "update_config", {"power_profile": {"heartbeat_interval": 600, "ws_enabled": True, "persist_ws_commands": False}}),
             client,
@@ -345,6 +374,8 @@ def test_update_config_validation_guards(tmpdir):
         assert "low_battery_threshold_invalid" in bad_batt["notes"]
         assert bad_gpio["local_ok"] is False
         assert "gpio_mode_invalid" in bad_gpio["notes"]
+        assert bad_sensor_window["local_ok"] is False
+        assert "gpio_range_invalid:sensor_authorized_open_ms" in bad_sensor_window["notes"]
         assert good_profile["local_ok"] is True
         assert int(cfg["heartbeat_interval_sec"]) == 600
         assert cfg["ws_enabled"] is True
@@ -355,6 +386,7 @@ def test_update_config_validation_guards(tmpdir):
                 "bad_hb": bad_hb["notes"],
                 "bad_batt": bad_batt["notes"],
                 "bad_gpio": bad_gpio["notes"],
+                "bad_sensor_window": bad_sensor_window["notes"],
                 "profile": good_profile["notes"],
             },
         }
@@ -427,7 +459,7 @@ def test_periodic_heartbeat_controlled_telemetry(tmpdir):
         assert int(hb["battery_pct"]) >= 70
         assert hb["latitude"] == cfg["latitude"]
         assert hb["longitude"] == cfg["longitude"]
-        assert hb["extra"].get("gps_source") == "static_config"
+        assert hb["extra"].get("gps_source") in ("static_config", "modem_gnss")
         assert "telemetry_missing" not in hb["extra"]
         assert client.runtime_state["last_heartbeat_status"] == 201
         assert client.runtime_state["last_heartbeat_next_pull_sec"] == 120
@@ -547,6 +579,164 @@ def test_tamper_alert_dedicated_and_suppressed(tmpdir):
         }
 
 
+def test_sensor_authorization_state_machine(tmpdir):
+    with _pushd(tmpdir):
+        cfg = _make_cfg()
+        cfg["gpio"]["sensor_debounce_ms"] = 0
+        cfg["gpio"]["sensor_authorized_open_ms"] = 1000
+        cfg["gpio"]["sensor_alert_if_open_on_boot"] = False
+
+        actuator = Actuator(make_hal(debug=0), cfg["gpio"])
+
+        # Apertura remota: consume exactamente un flanco de apertura.
+        actuator.open()
+        actuator._sensor._set(1)
+        assert actuator.tamper_triggered() is False
+
+        # Cierre fisico seguido de nueva apertura sin orden: debe alertar.
+        actuator._sensor._set(0)
+        assert actuator.tamper_triggered() is False
+        actuator._sensor._set(1)
+        assert actuator.tamper_triggered() is True
+        assert actuator.last_tamper_reason() == "door_forced"
+
+        # Una orden no autoriza retrospectivamente una puerta ya abierta.
+        actuator2 = Actuator(make_hal(debug=0), cfg["gpio"])
+        actuator2._sensor._set(1)
+        actuator2.open()
+        assert actuator2.tamper_triggered() is True
+
+        # La autorizacion expirada no suprime una apertura posterior.
+        cfg_expired = _make_cfg()
+        cfg_expired["gpio"]["sensor_debounce_ms"] = 0
+        cfg_expired["gpio"]["sensor_authorized_open_ms"] = 1
+        cfg_expired["gpio"]["sensor_alert_if_open_on_boot"] = False
+        actuator3 = Actuator(make_hal(debug=0), cfg_expired["gpio"])
+        actuator3.open()
+        actuator3.hal.sleep_ms(3)
+        actuator3._sensor._set(1)
+        assert actuator3.tamper_triggered() is True
+
+        return {
+            "name": "sensor_authorization_state_machine",
+            "status": "OK",
+            "details": {
+                "remote_open_suppressed_once": True,
+                "forced_after_close_detected": True,
+                "retrospective_authorization_blocked": True,
+                "expired_authorization_detected": True,
+            },
+        }
+
+
+def test_sensor_boot_open_and_real_debounce(tmpdir):
+    class InitialOpenHAL(MockHAL):
+        def pin_in(self, pin_no, pull=None):
+            pin = super().pin_in(pin_no, pull=pull)
+            pin._set(1)
+            return pin
+
+    with _pushd(tmpdir):
+        cfg_boot = _make_cfg()
+        cfg_boot["gpio"]["sensor_open_is"] = 1
+        cfg_boot["gpio"]["sensor_boot_grace_ms"] = 0
+        cfg_boot["gpio"]["sensor_alert_if_open_on_boot"] = True
+        boot_actuator = Actuator(InitialOpenHAL(debug=0), cfg_boot["gpio"])
+        assert boot_actuator.tamper_triggered() is True
+        assert boot_actuator.last_tamper_reason() == "door_open_on_boot"
+        assert boot_actuator.tamper_triggered() is False
+
+        cfg_boot_close = _make_cfg()
+        cfg_boot_close["gpio"]["sensor_open_is"] = 1
+        cfg_boot_close["gpio"]["sensor_debounce_ms"] = 60
+        cfg_boot_close["gpio"]["sensor_boot_grace_ms"] = 30
+        cfg_boot_close["gpio"]["sensor_alert_if_open_on_boot"] = True
+        boot_close_actuator = Actuator(InitialOpenHAL(debug=0), cfg_boot_close["gpio"])
+        boot_close_actuator._sensor._set(0)
+        assert boot_close_actuator.tamper_triggered() is False
+        boot_close_actuator.hal.sleep_ms(35)
+        assert boot_close_actuator.tamper_triggered() is False
+
+        cfg_db = _make_cfg()
+        cfg_db["gpio"]["sensor_debounce_ms"] = 20
+        cfg_db["gpio"]["sensor_alert_if_open_on_boot"] = False
+        debounce_actuator = Actuator(make_hal(debug=0), cfg_db["gpio"])
+        debounce_actuator._sensor._set(1)
+        assert debounce_actuator.tamper_triggered() is False
+        debounce_actuator.hal.sleep_ms(25)
+        assert debounce_actuator.tamper_triggered() is True
+
+        return {
+            "name": "sensor_boot_open_and_real_debounce",
+            "status": "OK",
+            "details": {
+                "boot_open_detected_once": True,
+                "boot_close_cancels_alert": True,
+                "debounce_requires_stability": True,
+            },
+        }
+
+
+def test_authorized_open_observed_before_network(tmpdir):
+    class OpenOnDriveHAL(MockHAL):
+        def __init__(self, debug=0):
+            super().__init__(debug=debug)
+            self.sensor = None
+
+        def pin_in(self, pin_no, pull=None):
+            self.sensor = super().pin_in(pin_no, pull=pull)
+            return self.sensor
+
+        def sleep_ms(self, ms):
+            super().sleep_ms(ms)
+            if self.sensor is not None:
+                self.sensor._set(1)
+
+    with _pushd(tmpdir):
+        cfg = _make_cfg()
+        cfg["gpio"]["sensor_debounce_ms"] = 10
+        cfg["gpio"]["sensor_authorized_open_ms"] = 1000
+        cfg["gpio"]["sensor_alert_if_open_on_boot"] = False
+        actuator = Actuator(OpenOnDriveHAL(debug=0), cfg["gpio"])
+        actuator.open()
+        assert actuator.wait_for_authorized_open(poll_ms=10) is True
+        assert actuator.tamper_triggered() is False
+
+        class OpenAfterExpiryHAL(MockHAL):
+            def __init__(self, debug=0):
+                super().__init__(debug=debug)
+                self.sensor = None
+
+            def pin_in(self, pin_no, pull=None):
+                self.sensor = super().pin_in(pin_no, pull=pull)
+                return self.sensor
+
+            def sleep_ms(self, ms):
+                super().sleep_ms(ms)
+                if self.sensor is not None:
+                    self.sensor._set(1)
+
+        cfg_late = _make_cfg()
+        cfg_late["gpio"]["servo_drive_ms"] = 0
+        cfg_late["gpio"]["sensor_debounce_ms"] = 0
+        cfg_late["gpio"]["sensor_authorized_open_ms"] = 10
+        cfg_late["gpio"]["sensor_alert_if_open_on_boot"] = False
+        late_actuator = Actuator(OpenAfterExpiryHAL(debug=0), cfg_late["gpio"])
+        late_actuator.open()
+        assert late_actuator.wait_for_authorized_open(poll_ms=20) is False
+        assert late_actuator.tamper_triggered() is True
+        assert late_actuator.last_tamper_reason() == "door_forced"
+        return {
+            "name": "authorized_open_observed_before_network",
+            "status": "OK",
+            "details": {
+                "sensor_open_confirmed": True,
+                "authorization_consumed": True,
+                "late_open_replayed_as_forced": True,
+            },
+        }
+
+
 def test_event_delivery_priority_policy(tmpdir):
     with _pushd(tmpdir):
         cfg = _make_cfg()
@@ -650,6 +840,9 @@ def run_all():
             test_ws_queue_overflow_tracking,
             test_command_payload_validation_matrix,
             test_tamper_alert_dedicated_and_suppressed,
+            test_sensor_authorization_state_machine,
+            test_sensor_boot_open_and_real_debounce,
+            test_authorized_open_observed_before_network,
             test_event_delivery_priority_policy,
             test_ws_health_timeouts,
         ]

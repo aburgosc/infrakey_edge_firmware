@@ -91,19 +91,23 @@ def _base_telemetry(client):
         "lte": "OK",
         "fw": client.fw,
     }
-    latitude = client.latitude
-    longitude = client.longitude
     gps_mode = gps_cfg.get("mode", "static_config")
     allow_static = bool(gps_cfg.get("allow_static", True))
-    if gps_mode == "static_config" and allow_static:
-        if latitude is not None:
-            payload["latitude"] = latitude
-        if longitude is not None:
-            payload["longitude"] = longitude
-        if gps_cfg.get("include_source", True):
-            payload["gps_source"] = "static_config"
-    else:
+    location = {}
+    try:
+        location = client.resolve_location(force=False)
+    except Exception:
+        location = {}
+    if "latitude" in location:
+        payload["latitude"] = location["latitude"]
+    if "longitude" in location:
+        payload["longitude"] = location["longitude"]
+    if "gps_source" in location:
+        payload["gps_source"] = location["gps_source"]
+    if "latitude" not in payload or "longitude" not in payload:
         telemetry_missing.append("gps")
+        if gps_mode == "static_config" and allow_static and gps_cfg.get("include_source", True):
+            payload["gps_source"] = "static_config"
     if battery_v is not None:
         payload["battery_v"] = round(float(battery_v), 3)
     else:
@@ -140,6 +144,8 @@ def _validate_gpio_patch(patch):
         "open_pin", "close_pin", "servo_pwm_pin", "servo_freq",
         "servo_open_us", "servo_close_us", "servo_drive_ms",
         "sensor_pin", "sensor_open_is", "sensor_pull", "sensor_debounce_ms",
+        "sensor_authorized_open_ms", "sensor_alert_if_open_on_boot",
+        "sensor_boot_grace_ms",
         "tamper_pin", "tamper_pull", "tamper_active_high",
     }
     out = {}
@@ -154,7 +160,11 @@ def _validate_gpio_patch(patch):
             if value not in ("up", "down", None):
                 return False, "gpio_pull_invalid:{}".format(key)
             out[key] = value
-        elif key in ("actuator_active_high", "tamper_active_high"):
+        elif key in (
+            "actuator_active_high",
+            "tamper_active_high",
+            "sensor_alert_if_open_on_boot",
+        ):
             b = _safe_bool(value)
             if b is None:
                 return False, "gpio_bool_invalid:{}".format(key)
@@ -163,6 +173,16 @@ def _validate_gpio_patch(patch):
             iv = _safe_int(value, None)
             if iv not in (0, 1):
                 return False, "gpio_sensor_open_invalid"
+            out[key] = iv
+        elif key in (
+            "sensor_debounce_ms",
+            "sensor_authorized_open_ms",
+            "sensor_boot_grace_ms",
+        ):
+            iv = _safe_int(value, None)
+            max_value = 2000 if key == "sensor_debounce_ms" else 60000
+            if iv is None or iv < 0 or iv > max_value:
+                return False, "gpio_range_invalid:{}".format(key)
             out[key] = iv
         else:
             iv = _safe_int(value, None)
@@ -411,6 +431,12 @@ def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
             actuator.open()
         except Exception as e:
             ok, notes = False, "open_failed:{}".format(e)
+        sensor_open_confirmed = None
+        if ok:
+            try:
+                sensor_open_confirmed = actuator.wait_for_authorized_open()
+            except Exception as e:
+                notes += ";sensor_observation_failed:{}".format(e)
         st_auth_granted = None
         if ok:
             st_auth_granted, _, _ = _emit_event(
@@ -421,7 +447,10 @@ def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
                 severity="info",
                 event_id="{}-authgranted".format(cmd.id),
                 ts=tstamp,
-                extra={"source": cmd.source or "command"},
+                extra={
+                    "source": cmd.source or "command",
+                    "sensor_open_confirmed": sensor_open_confirmed,
+                },
             )
         st_event, obj_event, dbg_event = _report_documented_state_event(
             client,
@@ -431,7 +460,7 @@ def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
             ts=tstamp,
             success_status="device_opened" if ok else None,
             failure_note="skip",
-            extra=None,
+            extra={"sensor_open_confirmed": sensor_open_confirmed},
         )
         note = "{};auth_request:{};auth_granted:{};report:{}".format(
             notes,
@@ -571,10 +600,18 @@ def handle_periodic_tasks(client, actuator, device_id, token, last_hb_ms, next_s
     if actuator.tamper_triggered():
         now_ms = client.hal.ticks_ms()
         suppress_ms = _safe_int(client.cfg.get("runtime", {}).get("tamper_repeat_suppress_ms", 15000), 15000)
-        last_tamper_ms = _safe_int(client.runtime_state.get("last_tamper_event_ms", 0), 0)
-        if client.hal.ticks_diff(now_ms, last_tamper_ms) >= suppress_ms:
+        last_tamper_ms = client.runtime_state.get("last_tamper_event_ms")
+        can_emit = last_tamper_ms is None
+        if last_tamper_ms is not None:
+            last_tamper_ms = _safe_int(last_tamper_ms, now_ms)
+            can_emit = client.hal.ticks_diff(now_ms, last_tamper_ms) >= suppress_ms
+        if can_emit:
             client.runtime_state["last_tamper_event_ms"] = now_ms
             ev_id = "ev-unauth-{}".format(now_ms)
+            try:
+                reason = actuator.last_tamper_reason() or "door_forced"
+            except Exception:
+                reason = "door_forced"
             _emit_event(
                 client,
                 device_id, token,
@@ -582,7 +619,7 @@ def handle_periodic_tasks(client, actuator, device_id, token, last_hb_ms, next_s
                 severity="warning",
                 event_id=ev_id + "-tamper",
                 ts=ts,
-                extra={"reason": "tamper_edge"},
+                extra={"reason": reason, "security_event_id": ev_id},
                 queue_on_fail=True,
             )
             _emit_event(
@@ -592,7 +629,7 @@ def handle_periodic_tasks(client, actuator, device_id, token, last_hb_ms, next_s
                 severity="emergency",
                 event_id=ev_id,
                 ts=ts,
-                extra={"reason": "door_forced"},
+                extra={"reason": reason, "security_event_id": ev_id},
                 queue_on_fail=True,
             )
 

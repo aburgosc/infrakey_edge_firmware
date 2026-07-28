@@ -1,4 +1,4 @@
-﻿# WebSocket feeder para ActionCable: wss://<host>/cable
+# WebSocket feeder para ActionCable: wss://<host>/cable
 # - Handshake RFC6455
 # - Frames Text (JSON), Ping/Pong (cliente enmascara)
 # - Suscripcion a DeviceCommandsChannel
@@ -72,11 +72,12 @@ class WebSocketCommandFeeder:
     TLS con el modem, upgrade WebSocket, Suscripcion a DeviceCommandsChannel
     y entrega comandos via pull(). ACK opcional por WS.
     """
-    def __init__(self, modem, hal, host, port=443, token=None, identifier_extra=None, debug=1, sock_id=1, max_queue=32, token_in_query=False):
+    def __init__(self, modem, hal, host, port=443, token=None, identifier_extra=None, debug=1, sock_id=1, max_queue=32, token_in_query=False, connect_host=None):
         self.m = modem
         self.hal = hal
         self.host = host
         self.port = port
+        self.connect_host = connect_host
         self.token = token
         self.identifier_extra = identifier_extra or {}  # e.g. {"device_id": ...}
         self.debug = debug
@@ -211,7 +212,7 @@ class WebSocketCommandFeeder:
         self._log1("[ws] conectando wss://{}:{}{}".format(self.host, self.port, _WS_PATH))
         prev = self._swap_to_ws_cid()
         try:
-            if not self.m.socket_open(self.host, self.port):
+            if not self.m.socket_open(self.host, self.port, connect_host=self.connect_host):
                 self._log1("[ws] no se pudo abrir socket TLS")
                 return False
         finally:
@@ -276,14 +277,15 @@ class WebSocketCommandFeeder:
         if leftover:
             self._log2("[ws] leftover posheader bytes=", len(leftover))
             self._buf += leftover
+            self._parse_frames_into_queue()
 
         ident_dict = {"channel": "DeviceCommandsChannel"}
         ident_dict.update(self.identifier_extra)
-        self._identifier_str = json.dumps(ident_dict)
+        self._identifier_str = json.dumps(ident_dict, separators=(",", ":"))
 
         sub = {"command": "subscribe", "identifier": self._identifier_str}
         self._log1("[ws] suscribiendo:", self._identifier_str)
-        if not self._send(self._build_frame_text(json.dumps(sub).encode())):
+        if not self._send(self._build_frame_text(json.dumps(sub, separators=(",", ":")).encode())):
             self._log1("[ws] fallo envio subscribe")
             prev4 = self._swap_to_ws_cid()
             try:
@@ -461,10 +463,17 @@ class WebSocketCommandFeeder:
                 self._last_rx_ms = self.hal.ticks_ms()
                 self._log1("[ws] suscripcion confirmada")
                 continue
+            if typ == "reject_subscription":
+                self._log1("[ws] suscripcion rechazada:", txt)
+                self.connected = False
+                self.subscribed = False
+                continue
             if typ == "ping":
                 self._log2("[ws] srv: ping")
                 self._last_rx_ms = self.hal.ticks_ms()
                 continue
+            if typ and self.debug >= 1:
+                self._log1("[ws] mensaje control:", txt)
 
             payload = None
             if typ == "message":
@@ -497,6 +506,8 @@ class WebSocketCommandFeeder:
     def tick(self, max_reads=3):
         if not self.connected:
             return
+        if self._buf:
+            self._parse_frames_into_queue()
         total_read = 0
         for _ in range(max_reads):
             chunk = self._recv_some(1460, 700)
