@@ -66,6 +66,7 @@ class Command:
         self.id = cmd_id
         self.type = cmd_type
         self.payload = payload or {}
+        self.source = "ws"
 
 class WebSocketCommandFeeder:
     """
@@ -114,6 +115,18 @@ class WebSocketCommandFeeder:
             try: print(*a)
             except Exception: pass
 
+    def _redact_bytes(self, data):
+        safe = data if isinstance(data, bytes) else bytes(data)
+        if not self.token:
+            return safe
+        try:
+            token_bytes = str(self.token).encode()
+            if token_bytes:
+                safe = safe.replace(token_bytes, b"<redacted>")
+        except Exception:
+            pass
+        return safe
+
     # ---------- CID save/restore ----------
     def _swap_to_ws_cid(self):
         prev = getattr(self.m, "SOCK_ID", 0)
@@ -137,7 +150,8 @@ class WebSocketCommandFeeder:
     def _send(self, data: bytes) -> bool:
         prev = self._swap_to_ws_cid()
         try:
-            self._log2("[ws>>raw] len=", len(data), " preview(hex)=", _hex_preview(data))
+            safe_preview = self._redact_bytes(data)
+            self._log2("[ws>>raw] len=", len(data), " preview(hex)=", _hex_preview(safe_preview))
             ok = self.m.socket_send(data)
             if not ok:
                 self._log1("[ws] socket_send fallo (len=", len(data), ")")
@@ -236,7 +250,7 @@ class WebSocketCommandFeeder:
         if self.token:
             hdrs.append("Authorization: Bearer {}".format(self.token))
         req = ("\r\n".join(hdrs) + "\r\n\r\n").encode()
-        self._log2("[ws>>]\n" + _safe_decode(req))
+        self._log2("[ws>>]\n" + _safe_decode(self._redact_bytes(req)))
         if not self._send(req):
             self._log1("[ws] CASEND fallo (upgrade)")
             prev2 = self._swap_to_ws_cid()
@@ -322,7 +336,8 @@ class WebSocketCommandFeeder:
             header = bytes([b0, 0x80 | 127]) + ln.to_bytes(8, "big")
         mask, masked = self._mask_client_frame(payload)
         frame = header + mask + masked
-        self._log2("[ws>>frame:text] len=", len(frame), " payload_len=", ln, " payload_preview=", _safe_decode(payload, 120))
+        safe_payload = self._redact_bytes(payload)
+        self._log2("[ws>>frame:text] len=", len(frame), " payload_len=", ln, " payload_preview=", _safe_decode(safe_payload, 120))
         return frame
 
     def _build_frame_ping(self, payload: bytes = b""):
@@ -476,7 +491,9 @@ class WebSocketCommandFeeder:
                 self._log1("[ws] mensaje control:", txt)
 
             payload = None
-            if typ == "message":
+            # ActionCable envia mensajes de canal como
+            # {"identifier":"...","message":{...}} sin "type" superior.
+            if typ == "message" or (not typ and isinstance(obj.get("message"), dict)):
                 inner = obj.get("message")
                 if isinstance(inner, dict):
                     # Legacy: {"message":{"type":"command","data":{...}}}

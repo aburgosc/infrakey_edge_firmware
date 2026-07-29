@@ -519,6 +519,81 @@ def test_ws_queue_overflow_tracking(tmpdir):
         return {"name": "ws_queue_overflow_tracking", "status": "OK", "details": stats}
 
 
+def test_ws_debug_redacts_credentials(tmpdir):
+    with _pushd(tmpdir):
+        hal = make_hal(debug=0)
+        token = "SECRET-DEVICE-TOKEN"
+        feeder = WebSocketCommandFeeder(
+            modem=hal.m,
+            hal=hal,
+            host="infrakey.fasttrack.cloud",
+            token=token,
+            token_in_query=True,
+            debug=0,
+        )
+        request = (
+            "GET /cable?token={} HTTP/1.1\r\n"
+            "Authorization: Bearer {}\r\n\r\n"
+        ).format(token, token).encode()
+        redacted = feeder._redact_bytes(request)
+        assert token.encode() not in redacted
+        assert redacted.count(b"<redacted>") == 2
+        return {
+            "name": "ws_debug_redacts_credentials",
+            "status": "OK",
+            "details": {
+                "query_token_redacted": True,
+                "authorization_token_redacted": True,
+            },
+        }
+
+
+def test_ws_actioncable_envelope_without_top_level_type(tmpdir):
+    with _pushd(tmpdir):
+        hal = make_hal(debug=0)
+        feeder = WebSocketCommandFeeder(
+            modem=hal.m,
+            hal=hal,
+            host="infrakey.fasttrack.cloud",
+            token="TOK",
+            debug=0,
+        )
+        message = {
+            "identifier": '{"channel":"DeviceCommandsChannel"}',
+            "message": {
+                "id": "cmd-real-envelope",
+                "type": "open_actuator",
+                "payload": {"triggered_by": "admin@example.com"},
+                "created_at": "2026-07-29T00:39:10Z",
+            },
+        }
+        payload = json.dumps(message, separators=(",", ":")).encode()
+        payload_len = len(payload)
+        if payload_len <= 125:
+            frame = bytes([0x81, payload_len]) + payload
+        else:
+            frame = bytes([0x81, 126]) + payload_len.to_bytes(2, "big") + payload
+
+        feeder.connected = True
+        feeder._buf = frame
+        feeder._parse_frames_into_queue()
+        commands = feeder.pull(max_n=1)
+        assert len(commands) == 1
+        assert commands[0].id == "cmd-real-envelope"
+        assert commands[0].type == "open_actuator"
+        assert commands[0].payload["triggered_by"] == "admin@example.com"
+        assert commands[0].source == "ws"
+        return {
+            "name": "ws_actioncable_envelope_without_top_level_type",
+            "status": "OK",
+            "details": {
+                "id": commands[0].id,
+                "type": commands[0].type,
+                "source": commands[0].source,
+            },
+        }
+
+
 def test_command_payload_validation_matrix(tmpdir):
     with _pushd(tmpdir):
         cfg = _make_cfg()
@@ -838,6 +913,8 @@ def run_all():
             test_periodic_heartbeat_controlled_telemetry,
             test_local_action_survives_event_report_failure,
             test_ws_queue_overflow_tracking,
+            test_ws_debug_redacts_credentials,
+            test_ws_actioncable_envelope_without_top_level_type,
             test_command_payload_validation_matrix,
             test_tamper_alert_dedicated_and_suppressed,
             test_sensor_authorization_state_machine,

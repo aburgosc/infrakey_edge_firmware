@@ -280,6 +280,8 @@ class InfrakeyClient:
             body["latitude"] = location["latitude"]
         if "longitude" in location:
             body["longitude"] = location["longitude"]
+        if self.debug:
+            self._log("[claim] payload=", body)
         status, obj, dbg = self._request_with_retry(
             lambda: self.http.post_json("/api/v1/devices/claim", body),
             "claim",
@@ -429,6 +431,8 @@ class InfrakeyClient:
         return result
 
     def send_snapshot(self, device_id, auth_token, snapshot_dict):
+        if self.debug:
+            self._log("[snapshot] payload=", snapshot_dict)
         return self._authorized_request(
             "snapshot",
             lambda req_device_id, req_token: self.http.post_json(

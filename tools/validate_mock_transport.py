@@ -135,6 +135,93 @@ def test_infrakey_heartbeat_refresh_on_401():
             os.environ["SIM7080_USE_MOCK"] = prev_mock
 
 
+def test_claim_and_heartbeat_include_location():
+    prev_cwd = os.getcwd()
+    prev_mock = os.environ.get("SIM7080_USE_MOCK")
+    tmpdir = tempfile.mkdtemp(prefix="ifk-location-contract-")
+    try:
+        os.chdir(tmpdir)
+        os.environ["SIM7080_USE_MOCK"] = "1"
+        latitude = -41.46294
+        longitude = -72.96671
+        cfg = {
+            "host": "api.infrakey.fasttrack.cloud",
+            "port": 443,
+            "nb_band": 28,
+            "apn_fallback": "m2m.mock.cl",
+            "user_agent": "test-agent",
+            "fw": "v1.0.0",
+            "model": "Raspberry-Pi-G4",
+            "latitude": latitude,
+            "longitude": longitude,
+            "gps": {
+                "mode": "static_config",
+                "allow_static": True,
+                "include_source": True,
+                "cache_ms": 900000,
+            },
+            "http_retry_count": 1,
+            "http_retry_backoff_ms": 0,
+            "files": {
+                "token": "token.json",
+                "outbox": "outbox.jsonl",
+                "outbox_state": "outbox_state.json",
+            },
+            "runtime": {
+                "outbox_flush_max": 5,
+                "offline_after_heartbeat_failures": 3,
+            },
+        }
+
+        class CaptureHttp:
+            def __init__(self):
+                self.calls = []
+
+            def post_json(self, path, body, headers=None):
+                self.calls.append({"path": path, "body": dict(body)})
+                if path == "/api/v1/devices/claim":
+                    return 201, {"device_id": "DEV-LOC", "auth_token": "TOK-LOC"}, ""
+                return 200, {"ok": True, "next_pull_sec": 900}, ""
+
+            def get_json(self, path, headers=None):
+                return 200, {"ok": True}, ""
+
+        client = InfrakeyClient(cfg, debug=0)
+        client.http = CaptureHttp()
+        device_id, token = client.claim_if_needed()
+        assert device_id == "DEV-LOC"
+        assert token == "TOK-LOC"
+        st, _, _ = client.heartbeat(device_id, token)
+        assert st == 200
+
+        claim_body = client.http.calls[0]["body"]
+        heartbeat_body = client.http.calls[1]["body"]
+        for body in (claim_body, heartbeat_body):
+            assert body["latitude"] == latitude
+            assert body["longitude"] == longitude
+        return {
+            "name": "claim_and_heartbeat_include_location",
+            "status": "OK",
+            "details": {
+                "claim": {
+                    "latitude": claim_body["latitude"],
+                    "longitude": claim_body["longitude"],
+                },
+                "heartbeat": {
+                    "latitude": heartbeat_body["latitude"],
+                    "longitude": heartbeat_body["longitude"],
+                },
+            },
+        }
+    finally:
+        os.chdir(prev_cwd)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        if prev_mock is None:
+            os.environ.pop("SIM7080_USE_MOCK", None)
+        else:
+            os.environ["SIM7080_USE_MOCK"] = prev_mock
+
+
 def run_all():
     keys = [
         "SIM7080_MOCK_HEALTH_STATUS",
@@ -151,6 +238,7 @@ def run_all():
             test_mock_heartbeat_override,
             test_mock_ack_failure_override,
             test_infrakey_heartbeat_refresh_on_401,
+            test_claim_and_heartbeat_include_location,
         ]
         results = []
         for test_fn in tests:
