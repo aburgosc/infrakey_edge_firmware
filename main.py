@@ -52,7 +52,7 @@ def _safe_next_sleep(cfg, obj, fallback):
 
 
 def _make_ws(client, cfg, token, device_id, debug):
-    ws_debug = cfg.get("ws_debug", debug)
+    ws_debug = cfg.get("ws_debug", getattr(client, "modem_debug", debug))
     ws_host = cfg.get("ws_host", cfg["host"])
     if not ws_host:
         ws_host = cfg["host"]
@@ -146,6 +146,8 @@ def main():
     ws_reconnect_delay_ms = _bounded_sleep(runtime.get("ws_reconnect_delay_ms", 5000), 5000)
     ws_idle_timeout_ms = _bounded_sleep(runtime.get("ws_idle_timeout_ms", 90000), 90000)
     ws_confirm_timeout_ms = _bounded_sleep(runtime.get("ws_confirm_timeout_ms", 12000), 12000)
+    status_log_interval_sec = _bounded_sleep(runtime.get("status_log_interval_sec", 30), 30)
+    last_status_log_ms = 0
     if cfg.get("ws_enabled", False):
         ws = _make_ws(client, cfg, token, device_id, debug)
         last_ws_attempt_ms = client.hal.ticks_ms()
@@ -246,6 +248,41 @@ def main():
                         min_bytes=journal_compact_min_bytes,
                         min_ratio_pct=journal_compact_ratio_pct,
                     )
+
+                now_ms = client.hal.ticks_ms()
+                if status_log_interval_sec > 0 and client.hal.ticks_diff(now_ms, last_status_log_ms) >= (status_log_interval_sec * 1000):
+                    last_status_log_ms = now_ms
+                    state = {}
+                    try:
+                        state = actuator.state_snapshot()
+                    except Exception:
+                        state = {}
+                    ws_state = "disabled"
+                    if cfg.get("ws_enabled", False):
+                        ws_state = "ready" if (ws and ws.is_healthy(idle_timeout_ms=ws_idle_timeout_ms, confirm_timeout_ms=ws_confirm_timeout_ms)) else "down"
+                    queue_size = None
+                    try:
+                        queue_size = pipeline.stats().get("queue", {}).get("queued")
+                    except Exception:
+                        queue_size = None
+                    if getattr(client, "operational_debug", getattr(client, "debug", 0)):
+                        print(
+                            "[state]",
+                            "actuator_state=",
+                            state.get("actuator_state"),
+                            "door_state=",
+                            state.get("door_state"),
+                            "security_state=",
+                            state.get("security_state"),
+                            "ws=",
+                            ws_state,
+                            "last_hb=",
+                            client.runtime_state.get("last_heartbeat_status"),
+                            "queue=",
+                            queue_size,
+                            "tamper_suppressed=",
+                            bool(client.runtime_state.get("last_tamper_event_ms")),
+                        )
                 client.hal.sleep_ms(loop_sleep_ms)
             except Exception as exc:
                 print("[loop] error:", exc)

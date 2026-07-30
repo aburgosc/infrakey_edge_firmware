@@ -56,6 +56,7 @@ DEFAULT = {
         "max_command_queue": 32,
         "loop_sleep_ms": 100,
         "loop_error_backoff_ms": 500,
+        "status_log_interval_sec": 30,
         "ws_pull_max": 10,
         "ws_queue_max": 32,
         "journal_pull_max": 10,
@@ -77,6 +78,8 @@ DEFAULT = {
         "ws_identifier_include_device_id": False,
         "ws_token_in_query": False,
         "tamper_repeat_suppress_ms": 15000,
+        "debug_operational_enabled": True,
+        "debug_modem_enabled": False,
     },
     "features": {
         "allow_snapshot": True,

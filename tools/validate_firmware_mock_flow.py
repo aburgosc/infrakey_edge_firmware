@@ -217,8 +217,12 @@ def test_authorization_and_command_flow(tmpdir):
         ws = WsAckStub()
 
         res_open = handle_command(SimpleCmd("open-1", "open_actuator"), client, actuator, cfg, "DEV", "TOK", ws=ws)
+        actuator._sensor._set(1)
+        handle_periodic_tasks(client, actuator, "DEV", "TOK", client.hal.ticks_ms(), 9999)
         res_pulse = handle_command(SimpleCmd("pulse-1", "pulse_actuator", {"duration_ms": 250}), client, actuator, cfg, "DEV", "TOK", ws=ws)
         res_close = handle_command(SimpleCmd("close-1", "close_actuator"), client, actuator, cfg, "DEV", "TOK", ws=ws)
+        actuator._sensor._set(0)
+        handle_periodic_tasks(client, actuator, "DEV", "TOK", client.hal.ticks_ms(), 9999)
 
         statuses = [e["status"] for e in client.events]
         assert res_open["local_ok"] is True
@@ -492,7 +496,7 @@ def test_local_action_survives_event_report_failure(tmpdir):
         result = handle_command(SimpleCmd("open-fail-report", "open_actuator"), client, actuator, cfg, "DEV", "TOK", ws=ws)
         assert result["local_ok"] is True
         assert result["ack_http_ok"] is True
-        assert "report:fail:500" in result["notes"]
+        assert "report:deferred_to_sensor" in result["notes"]
         assert "auth_request:fail:500" in result["notes"] or "auth_request:ok" in result["notes"]
         return {"name": "local_action_survives_event_report_failure", "status": "OK", "details": result}
 
@@ -632,7 +636,16 @@ def test_tamper_alert_dedicated_and_suppressed(tmpdir):
         cfg["runtime"]["tamper_repeat_suppress_ms"] = 60000
         client = MockAppClient(cfg, debug=0)
         actuator = Actuator(client.hal, cfg["gpio"])
-        actuator.tamper_triggered = lambda: True
+        transition = {
+            "kind": "door_forced_open",
+            "reason": "door_forced",
+            "actuator_state": "unknown",
+            "door_state": "open",
+            "security_state": "locked",
+            "at_ms": client.hal.ticks_ms(),
+        }
+        queue = [dict(transition), dict(transition)]
+        actuator.poll_transition = lambda: queue.pop(0) if queue else None
 
         handle_periodic_tasks(client, actuator, "DEV", "TOK", client.hal.ticks_ms(), 9999)
         handle_periodic_tasks(client, actuator, "DEV", "TOK", client.hal.ticks_ms(), 9999)
@@ -663,43 +676,34 @@ def test_sensor_authorization_state_machine(tmpdir):
 
         actuator = Actuator(make_hal(debug=0), cfg["gpio"])
 
-        # Apertura remota: consume exactamente un flanco de apertura.
+        # Apertura remota: toda apertura posterior sigue autorizada hasta cierre.
         actuator.open()
         actuator._sensor._set(1)
-        assert actuator.tamper_triggered() is False
+        assert actuator.poll_transition()["kind"] == "door_opened_authorized"
 
-        # Cierre fisico seguido de nueva apertura sin orden: debe alertar.
+        # Cierre fisico vuelve a locked.
         actuator._sensor._set(0)
-        assert actuator.tamper_triggered() is False
+        assert actuator.poll_transition()["kind"] == "door_closed"
+
+        # Nueva apertura sin orden: debe alertar.
         actuator._sensor._set(1)
-        assert actuator.tamper_triggered() is True
+        assert actuator.poll_transition()["kind"] == "door_forced_open"
         assert actuator.last_tamper_reason() == "door_forced"
 
-        # Una orden no autoriza retrospectivamente una puerta ya abierta.
+        # Una orden remota sobre puerta ya abierta no debe duplicar device_opened.
         actuator2 = Actuator(make_hal(debug=0), cfg["gpio"])
         actuator2._sensor._set(1)
         actuator2.open()
-        assert actuator2.tamper_triggered() is True
-
-        # La autorizacion expirada no suprime una apertura posterior.
-        cfg_expired = _make_cfg()
-        cfg_expired["gpio"]["sensor_debounce_ms"] = 0
-        cfg_expired["gpio"]["sensor_authorized_open_ms"] = 1
-        cfg_expired["gpio"]["sensor_alert_if_open_on_boot"] = False
-        actuator3 = Actuator(make_hal(debug=0), cfg_expired["gpio"])
-        actuator3.open()
-        actuator3.hal.sleep_ms(3)
-        actuator3._sensor._set(1)
-        assert actuator3.tamper_triggered() is True
+        assert actuator2.state_snapshot()["security_state"] == "unlocked_authorized"
+        assert actuator2.poll_transition() is None
 
         return {
             "name": "sensor_authorization_state_machine",
             "status": "OK",
             "details": {
-                "remote_open_suppressed_once": True,
+                "remote_open_persistent_authorized": True,
                 "forced_after_close_detected": True,
-                "retrospective_authorization_blocked": True,
-                "expired_authorization_detected": True,
+                "already_open_does_not_duplicate_event": True,
             },
         }
 
@@ -718,7 +722,7 @@ def test_sensor_boot_open_and_real_debounce(tmpdir):
         cfg_boot["gpio"]["sensor_alert_if_open_on_boot"] = True
         boot_actuator = Actuator(InitialOpenHAL(debug=0), cfg_boot["gpio"])
         assert boot_actuator.tamper_triggered() is True
-        assert boot_actuator.last_tamper_reason() == "door_open_on_boot"
+        assert boot_actuator.last_tamper_reason() == "open_on_boot_unknown"
         assert boot_actuator.tamper_triggered() is False
 
         cfg_boot_close = _make_cfg()
@@ -776,38 +780,12 @@ def test_authorized_open_observed_before_network(tmpdir):
         actuator.open()
         assert actuator.wait_for_authorized_open(poll_ms=10) is True
         assert actuator.tamper_triggered() is False
-
-        class OpenAfterExpiryHAL(MockHAL):
-            def __init__(self, debug=0):
-                super().__init__(debug=debug)
-                self.sensor = None
-
-            def pin_in(self, pin_no, pull=None):
-                self.sensor = super().pin_in(pin_no, pull=pull)
-                return self.sensor
-
-            def sleep_ms(self, ms):
-                super().sleep_ms(ms)
-                if self.sensor is not None:
-                    self.sensor._set(1)
-
-        cfg_late = _make_cfg()
-        cfg_late["gpio"]["servo_drive_ms"] = 0
-        cfg_late["gpio"]["sensor_debounce_ms"] = 0
-        cfg_late["gpio"]["sensor_authorized_open_ms"] = 10
-        cfg_late["gpio"]["sensor_alert_if_open_on_boot"] = False
-        late_actuator = Actuator(OpenAfterExpiryHAL(debug=0), cfg_late["gpio"])
-        late_actuator.open()
-        assert late_actuator.wait_for_authorized_open(poll_ms=20) is False
-        assert late_actuator.tamper_triggered() is True
-        assert late_actuator.last_tamper_reason() == "door_forced"
         return {
             "name": "authorized_open_observed_before_network",
             "status": "OK",
             "details": {
                 "sensor_open_confirmed": True,
-                "authorization_consumed": True,
-                "late_open_replayed_as_forced": True,
+                "authorization_persists_until_close": True,
             },
         }
 

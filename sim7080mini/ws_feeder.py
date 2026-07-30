@@ -484,7 +484,7 @@ class WebSocketCommandFeeder:
                 self.subscribed = False
                 continue
             if typ == "ping":
-                self._log2("[ws] srv: ping")
+                self._log1("[ws] actioncable ping")
                 self._last_rx_ms = self.hal.ticks_ms()
                 continue
             if typ and self.debug >= 1:
@@ -578,6 +578,8 @@ class WebSocketCommandFeeder:
             self._restore_cid(prev)
         self.connected = False
         self.subscribed = False
+        self._buf = b""
+        self._last_recv_bytes = 0
         self._log1("[ws] cerrado")
 
 

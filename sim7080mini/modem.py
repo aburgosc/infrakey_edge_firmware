@@ -423,11 +423,69 @@ class SIM7080:
         ok_q2, r_q2 = self.hal.send_at("+CNACT?", "OK", 1500)
         return self._cnact_context_active(r_q2 or "", cid=0)
 
+    def _socket_state(self):
+        ok, resp = self.hal.send_at("+CASTATE?", "OK", 1200)
+        if not ok:
+            return None
+        try:
+            for ln in (resp or "").splitlines():
+                if "+CASTATE:" not in ln:
+                    continue
+                body = ln.split(":", 1)[1].strip()
+                parts = [p.strip() for p in body.split(",")]
+                if len(parts) < 2:
+                    continue
+                cid = int(parts[0])
+                state = int(parts[1])
+                if cid == self.SOCK_ID:
+                    return state
+        except Exception:
+            pass
+        return None
+
+    def _close_socket_and_wait_closed(self, close_timeout_ms=4000, wait_closed_ms=2500, settle_ms=400):
+        self.hal.send_at("+CACLOSE={}".format(self.SOCK_ID), None, close_timeout_ms)
+        t0 = self.hal.ticks_ms()
+        while self.hal.ticks_diff(self.hal.ticks_ms(), t0) < wait_closed_ms:
+            state = self._socket_state()
+            if state in (0, None):
+                self.hal.sleep_ms(max(0, int(settle_ms)))
+                return True
+            self.hal.sleep_ms(150)
+        self.hal.sleep_ms(max(0, int(settle_ms)))
+        return False
+
+    def _handle_caopen_error(self, rc, host, port, target):
+        if rc not in (2, 27):
+            return False
+        if rc == 2:
+            _log_debug(self.debug, "[sock] rc=2 sin memoria; liberando CID y esperando modem")
+            self._close_socket_and_wait_closed(close_timeout_ms=4000, wait_closed_ms=4000, settle_ms=1200)
+            self.hal.sleep_ms(3000)
+        else:
+            _log_debug(self.debug, "[sock] rc=27; esperando estabilizacion PDP y reintentando")
+            self._close_socket_and_wait_closed(close_timeout_ms=4000, wait_closed_ms=3000, settle_ms=800)
+            self._ensure_socket_context_ready(settle_ms=3000)
+        _log_debug(self.debug, "[sock] CAOPEN post-recovery CID={}, target={}, port={}".format(self.SOCK_ID, target, port))
+        self._write_at_noresp('+CAOPEN={},0,"TCP","{}",{}'.format(self.SOCK_ID, target, port))
+        ok_retry, mobj_retry, _ = self._read_urc_regex(
+            r"\+CAOPEN:\s*(\d+)\s*,\s*(\d+)",
+            timeout_ms=90000,
+            first_token=b"+"
+        )
+        if ok_retry:
+            cid_r = int(mobj_retry.group(1))
+            rc_r = int(mobj_retry.group(2))
+            _log_debug(self.debug, "[sock] +CAOPEN post-recovery:", cid_r, rc_r, ("OK" if rc_r == 0 else self._explain_caopen_err(rc_r)))
+            if cid_r == self.SOCK_ID and rc_r == 0:
+                return True
+        return False
+
     def socket_open(self, host, port=443, timeout_ms=90000, connect_host=None):
         self._ensure_cid()
 
         # Cierra por si quedó algo colgado
-        self.hal.send_at("+CACLOSE={}".format(self.SOCK_ID), None, 200)
+        self._close_socket_and_wait_closed(close_timeout_ms=4000, wait_closed_ms=2500, settle_ms=500)
 
         # Setup TLS (contexto)
         self._tls_basic_setup(host, force_cipher=None)
@@ -454,25 +512,11 @@ class SIM7080:
             _log_debug(self.debug, "[sock] +CAOPEN:", cid, rc, ("OK" if rc==0 else self._explain_caopen_err(rc)))
             if cid == self.SOCK_ID and rc == 0:
                 return True
-            if cid == self.SOCK_ID and rc == 27:
-                _log_debug(self.debug, "[sock] rc=27; esperando estabilizacion PDP y reintentando")
-                self.hal.send_at("+CACLOSE={}".format(self.SOCK_ID), None, 200)
-                self._ensure_socket_context_ready(settle_ms=3000)
-                _log_debug(self.debug, "[sock] CAOPEN post-settle CID={}, target={}, port={}".format(self.SOCK_ID, target, port))
-                self._write_at_noresp('+CAOPEN={},0,"TCP","{}",{}'.format(self.SOCK_ID, target, port))
-                ok1b, mobj1b, _ = self._read_urc_regex(
-                    r"\+CAOPEN:\s*(\d+)\s*,\s*(\d+)",
-                    timeout_ms=timeout_ms,
-                    first_token=b"+"
-                )
-                if ok1b:
-                    cid1b = int(mobj1b.group(1)); rc1b = int(mobj1b.group(2))
-                    _log_debug(self.debug, "[sock] +CAOPEN post-settle:", cid1b, rc1b, ("OK" if rc1b==0 else self._explain_caopen_err(rc1b)))
-                    if cid1b == self.SOCK_ID and rc1b == 0:
-                        return True
+            if cid == self.SOCK_ID and self._handle_caopen_error(rc, host, port, target):
+                return True
 
         # Reintento con ECDHE
-        self.hal.send_at("+CACLOSE={}".format(self.SOCK_ID), None, 200)
+        self._close_socket_and_wait_closed(close_timeout_ms=4000, wait_closed_ms=2500, settle_ms=500)
         self._tls_basic_setup(host, force_cipher=None)
         if not self._bind_tls_socket():
             _log_debug(self.debug, "[tls] no fue posible reenlazar socket y contexto")
@@ -493,22 +537,8 @@ class SIM7080:
             _log_debug(self.debug, "[sock] +CAOPEN (retry):", cid2, rc2, ("OK" if rc2==0 else self._explain_caopen_err(rc2)))
             if cid2 == self.SOCK_ID and rc2 == 0:
                 return True
-            if cid2 == self.SOCK_ID and rc2 == 27:
-                _log_debug(self.debug, "[sock] rc=27 en retry; esperando estabilizacion PDP y reintentando")
-                self.hal.send_at("+CACLOSE={}".format(self.SOCK_ID), None, 200)
-                self._ensure_socket_context_ready(settle_ms=3000)
-                _log_debug(self.debug, "[sock] CAOPEN retry post-settle CID={}, target={}, port={}".format(self.SOCK_ID, target, port))
-                self._write_at_noresp('+CAOPEN={},0,"TCP","{}",{}'.format(self.SOCK_ID, target, port))
-                ok2b, mobj2b, _ = self._read_urc_regex(
-                    r"\+CAOPEN:\s*(\d+)\s*,\s*(\d+)",
-                    timeout_ms=timeout_ms,
-                    first_token=b"+"
-                )
-                if ok2b:
-                    cid2b = int(mobj2b.group(1)); rc2b = int(mobj2b.group(2))
-                    _log_debug(self.debug, "[sock] +CAOPEN retry post-settle:", cid2b, rc2b, ("OK" if rc2b==0 else self._explain_caopen_err(rc2b)))
-                    if cid2b == self.SOCK_ID and rc2b == 0:
-                        return True
+            if cid2 == self.SOCK_ID and self._handle_caopen_error(rc2, host, port, target):
+                return True
 
         # Último recurso: CASTATE?
         _log_debug(self.debug, "[sock] Revisando CASTATE? (último recurso)")
@@ -531,7 +561,7 @@ class SIM7080:
         return False
 
     def socket_close(self):
-        self.hal.send_at("+CACLOSE={}".format(self.SOCK_ID), "OK", 4000)
+        return self._close_socket_and_wait_closed(close_timeout_ms=4000, wait_closed_ms=2500, settle_ms=400)
 
     def _wait_for_ok(self, timeout_ms=1500):
         """Espera SOLO el terminador '\r\nOK\r\n' sin chupar datos demás."""

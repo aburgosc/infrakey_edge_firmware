@@ -308,6 +308,14 @@ def _next_sleep_from_obj(cfg, obj, current):
     return next_sleep
 
 
+def _log_debug(client, *args):
+    if getattr(client, "operational_debug", getattr(client, "debug", 0)):
+        try:
+            print(*args)
+        except Exception:
+            pass
+
+
 def _ack_both(client, device_id, token, cmd_id, notes, ws=None, ok=True):
     ts = now_iso_utc_or_none(client.hal)
     ack_http_ok = False
@@ -323,11 +331,7 @@ def _ack_both(client, device_id, token, cmd_id, notes, ws=None, ok=True):
             ack_ws_ok = bool(ws.send_ack(cmd_id=cmd_id, ok=bool(ok), notes=notes or ""))
     except Exception:
         ack_ws_ok = False
-    if getattr(client, "debug", 0):
-        try:
-            print("[ack] id=", cmd_id, "http=", ack_http_ok, "ws=", ack_ws_ok, "ok=", bool(ok))
-        except Exception:
-            pass
+    _log_debug(client, "[ack] id=", cmd_id, "http=", ack_http_ok, "ws=", ack_ws_ok, "ok=", bool(ok))
     return ack_http_ok, ack_ws_ok
 
 
@@ -408,8 +412,104 @@ def _event_status_note(status_code):
     return "ok" if _result_ok(status_code) else "fail:{}".format(status_code)
 
 
+def _handle_sensor_transition(client, actuator, device_id, token, transition, ts=None):
+    if not transition:
+        return []
+
+    statuses = []
+    kind = transition.get("kind")
+    reason = transition.get("reason")
+    now_ts = ts or now_iso_utc_or_none(client.hal)
+    event_id_base = "ev-{}".format(transition.get("at_ms", client.hal.ticks_ms()))
+
+    _log_debug(
+        client,
+        "[sensor]",
+        kind,
+        "door=",
+        transition.get("door_state"),
+        "security=",
+        transition.get("security_state"),
+        "reason=",
+        reason,
+    )
+
+    if kind == "door_opened_authorized":
+        st_event, _, _ = _emit_event(
+            client,
+            device_id,
+            token,
+            status="device_opened",
+            severity="info",
+            event_id=event_id_base + "-opened",
+            ts=now_ts,
+            extra={"reason": "authorized_open"},
+        )
+        statuses.append(("device_opened", st_event))
+        return statuses
+
+    if kind == "door_closed":
+        st_event, _, _ = _emit_event(
+            client,
+            device_id,
+            token,
+            status="device_closed",
+            severity="info",
+            event_id=event_id_base + "-closed",
+            ts=now_ts,
+            extra={"reason": "door_closed"},
+        )
+        statuses.append(("device_closed", st_event))
+        return statuses
+
+    if kind == "door_open_on_boot_unknown":
+        st_event, _, _ = _emit_event(
+            client,
+            device_id,
+            token,
+            status="tamper_alert",
+            severity="warning",
+            event_id=event_id_base + "-boot-open",
+            ts=now_ts,
+            extra={"reason": reason or "open_on_boot_unknown"},
+            queue_on_fail=True,
+        )
+        statuses.append(("tamper_alert", st_event))
+        return statuses
+
+    if kind in ("door_forced_open", "tamper_level"):
+        st_tamper, _, _ = _emit_event(
+            client,
+            device_id,
+            token,
+            status="tamper_alert",
+            severity="warning",
+            event_id=event_id_base + "-tamper",
+            ts=now_ts,
+            extra={"reason": reason or "door_forced", "security_event_id": event_id_base},
+            queue_on_fail=True,
+        )
+        st_unauth, _, _ = _emit_event(
+            client,
+            device_id,
+            token,
+            status="unauthorized_access",
+            severity="emergency",
+            event_id=event_id_base,
+            ts=now_ts,
+            extra={"reason": reason or "door_forced", "security_event_id": event_id_base},
+            queue_on_fail=True,
+        )
+        statuses.append(("tamper_alert", st_tamper))
+        statuses.append(("unauthorized_access", st_unauth))
+        return statuses
+
+    return statuses
+
+
 def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
     tstamp = now_iso_utc_or_none(client.hal)
+    _log_debug(client, "[cmd>>] id=", cmd.id, "type=", cmd.type, "source=", cmd.source or "unknown")
     ok_payload, note_payload, normalized_payload = _validate_command_payload(cmd.type, cmd.payload)
     if not ok_payload:
         ack_http_ok, ack_ws_ok = _ack_both(client, device_id, token, cmd.id, note_payload, ws=ws, ok=False)
@@ -429,14 +529,9 @@ def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
         ok, notes = True, "Actuator opened"
         try:
             actuator.open()
+            _log_debug(client, "[actuator] command=open", actuator.state_snapshot())
         except Exception as e:
             ok, notes = False, "open_failed:{}".format(e)
-        sensor_open_confirmed = None
-        if ok:
-            try:
-                sensor_open_confirmed = actuator.wait_for_authorized_open()
-            except Exception as e:
-                notes += ";sensor_observation_failed:{}".format(e)
         st_auth_granted = None
         if ok:
             st_auth_granted, _, _ = _emit_event(
@@ -449,46 +544,29 @@ def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
                 ts=tstamp,
                 extra={
                     "source": cmd.source or "command",
-                    "sensor_open_confirmed": sensor_open_confirmed,
+                    "security_state": actuator.state_snapshot().get("security_state"),
                 },
             )
-        st_event, obj_event, dbg_event = _report_documented_state_event(
-            client,
-            device_id,
-            token,
-            event_id="{}-opened".format(cmd.id),
-            ts=tstamp,
-            success_status="device_opened" if ok else None,
-            failure_note="skip",
-            extra={"sensor_open_confirmed": sensor_open_confirmed},
-        )
         note = "{};auth_request:{};auth_granted:{};report:{}".format(
             notes,
             _event_status_note(st_auth_req),
             _event_status_note(st_auth_granted) if st_auth_granted is not None else "skip",
-            _event_status_note(st_event),
+            "deferred_to_sensor",
         )
         ack_http_ok, ack_ws_ok = _ack_both(client, device_id, token, cmd.id, note, ws=ws, ok=ok)
+        _log_debug(client, "[cmd<<] id=", cmd.id, "completed=", True, "ok=", ok, "notes=", note)
         return _result(ok, ack_http_ok=ack_http_ok, ack_ws_ok=ack_ws_ok, completed=True, notes=note)
 
     if cmd.type == "close_actuator":
         ok, notes = True, "Actuator closed"
         try:
             actuator.close()
+            _log_debug(client, "[actuator] command=close", actuator.state_snapshot())
         except Exception as e:
             ok, notes = False, "close_failed:{}".format(e)
-        st_event, obj_event, dbg_event = _report_documented_state_event(
-            client,
-            device_id,
-            token,
-            event_id="{}-closed".format(cmd.id),
-            ts=tstamp,
-            success_status="device_closed" if ok else None,
-            failure_note="skip",
-            extra=None,
-        )
-        note = "{};report:{}".format(notes, _event_status_note(st_event))
+        note = "{};report:{}".format(notes, "deferred_to_sensor")
         ack_http_ok, ack_ws_ok = _ack_both(client, device_id, token, cmd.id, note, ws=ws, ok=ok)
+        _log_debug(client, "[cmd<<] id=", cmd.id, "completed=", True, "ok=", ok, "notes=", note)
         return _result(ok, ack_http_ok=ack_http_ok, ack_ws_ok=ack_ws_ok, completed=True, notes=note)
 
     if cmd.type == "pulse_actuator":
@@ -506,6 +584,7 @@ def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
         ok, notes = True, "actuator_pulsed_{}ms".format(ms)
         try:
             actuator.pulse(ms=ms)
+            _log_debug(client, "[actuator] command=pulse", actuator.state_snapshot(), "duration_ms=", ms)
         except Exception as e:
             ok, notes = False, "pulse_failed:{}".format(e)
         st_auth_granted = None
@@ -528,6 +607,7 @@ def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
             report_note,
         )
         ack_http_ok, ack_ws_ok = _ack_both(client, device_id, token, cmd.id, note, ws=ws, ok=ok)
+        _log_debug(client, "[cmd<<] id=", cmd.id, "completed=", True, "ok=", ok, "notes=", note)
         return _result(ok, ack_http_ok=ack_http_ok, ack_ws_ok=ack_ws_ok, completed=True, notes=note)
 
     if cmd.type == "update_config":
@@ -537,6 +617,7 @@ def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
             ok_cfg = bool(persisted)
             note = "{};persisted:{}".format(note, "ok" if persisted else "fail")
         ack_http_ok, ack_ws_ok = _ack_both(client, device_id, token, cmd.id, note, ws=ws, ok=ok_cfg)
+        _log_debug(client, "[cmd<<] id=", cmd.id, "completed=", True, "ok=", ok_cfg, "notes=", note)
         return _result(ok_cfg, ack_http_ok=ack_http_ok, ack_ws_ok=ack_ws_ok, completed=True, notes=note)
 
     if cmd.type == "ping":
@@ -552,6 +633,7 @@ def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
             note_parts.append("missing={}".format(",".join(telemetry["telemetry_missing"])))
         note = ";".join(note_parts)
         ack_http_ok, ack_ws_ok = _ack_both(client, device_id, token, cmd.id, note, ws=ws, ok=True)
+        _log_debug(client, "[cmd<<] id=", cmd.id, "completed=", True, "ok=", True, "notes=", note)
         return _result(True, ack_http_ok=ack_http_ok, ack_ws_ok=ack_ws_ok, completed=True, notes=note)
 
     if cmd.type in ("snapshot", "instantanea"):
@@ -570,6 +652,7 @@ def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
         stc, obj, dbg = client.send_snapshot(device_id, token, snap)
         ok_snapshot = _result_ok(stc)
         ack_http_ok, ack_ws_ok = _ack_both(client, device_id, token, cmd.id, "snapshot:{}".format(stc), ws=ws, ok=ok_snapshot)
+        _log_debug(client, "[cmd<<] id=", cmd.id, "completed=", True, "ok=", ok_snapshot, "notes=", "snapshot:{}".format(stc))
         return _result(ok_snapshot, ack_http_ok=ack_http_ok, ack_ws_ok=ack_ws_ok, completed=True, notes="snapshot:{}".format(stc))
 
     if cmd.type == "test_event":
@@ -589,49 +672,37 @@ def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
         )
         ok_event = _result_ok(st_event)
         ack_http_ok, ack_ws_ok = _ack_both(client, device_id, token, cmd.id, "event sent:{}".format(st_event), ws=ws, ok=ok_event)
+        _log_debug(client, "[cmd<<] id=", cmd.id, "completed=", True, "ok=", ok_event, "notes=", "event sent:{}".format(st_event))
         return _result(ok_event, ack_http_ok=ack_http_ok, ack_ws_ok=ack_ws_ok, completed=True, notes="event sent:{}".format(st_event))
 
     ack_http_ok, ack_ws_ok = _ack_both(client, device_id, token, cmd.id, "unsupported:{}".format(cmd.type), ws=ws, ok=False)
+    _log_debug(client, "[cmd<<] id=", cmd.id, "completed=", True, "ok=", False, "notes=", "unsupported:{}".format(cmd.type))
     return _result(False, ack_http_ok=ack_http_ok, ack_ws_ok=ack_ws_ok, completed=True, notes="unsupported:{}".format(cmd.type))
 
 
 def handle_periodic_tasks(client, actuator, device_id, token, last_hb_ms, next_sleep):
     ts = now_iso_utc_or_none(client.hal)
-    if actuator.tamper_triggered():
-        now_ms = client.hal.ticks_ms()
-        suppress_ms = _safe_int(client.cfg.get("runtime", {}).get("tamper_repeat_suppress_ms", 15000), 15000)
-        last_tamper_ms = client.runtime_state.get("last_tamper_event_ms")
-        can_emit = last_tamper_ms is None
-        if last_tamper_ms is not None:
-            last_tamper_ms = _safe_int(last_tamper_ms, now_ms)
-            can_emit = client.hal.ticks_diff(now_ms, last_tamper_ms) >= suppress_ms
-        if can_emit:
-            client.runtime_state["last_tamper_event_ms"] = now_ms
-            ev_id = "ev-unauth-{}".format(now_ms)
-            try:
-                reason = actuator.last_tamper_reason() or "door_forced"
-            except Exception:
-                reason = "door_forced"
-            _emit_event(
-                client,
-                device_id, token,
-                status="tamper_alert",
-                severity="warning",
-                event_id=ev_id + "-tamper",
-                ts=ts,
-                extra={"reason": reason, "security_event_id": ev_id},
-                queue_on_fail=True,
-            )
-            _emit_event(
-                client,
-                device_id, token,
-                status="unauthorized_access",
-                severity="emergency",
-                event_id=ev_id,
-                ts=ts,
-                extra={"reason": reason, "security_event_id": ev_id},
-                queue_on_fail=True,
-            )
+    while True:
+        transition = actuator.poll_transition()
+        if not transition:
+            break
+
+        if transition.get("kind") in ("door_forced_open", "tamper_level"):
+            now_ms = transition.get("at_ms", client.hal.ticks_ms())
+            suppress_ms = _safe_int(client.cfg.get("runtime", {}).get("tamper_repeat_suppress_ms", 15000), 15000)
+            last_tamper_ms = client.runtime_state.get("last_tamper_event_ms")
+            can_emit = last_tamper_ms is None
+            if last_tamper_ms is not None:
+                last_tamper_ms = _safe_int(last_tamper_ms, now_ms)
+                can_emit = client.hal.ticks_diff(now_ms, last_tamper_ms) >= suppress_ms
+            if can_emit:
+                client.runtime_state["last_tamper_event_ms"] = now_ms
+                _handle_sensor_transition(client, actuator, device_id, token, transition, ts=ts)
+            else:
+                _log_debug(client, "[sensor] tamper suprimido", transition)
+            continue
+
+        _handle_sensor_transition(client, actuator, device_id, token, transition, ts=ts)
 
     battery_v, battery_pct = _read_battery_metrics(client)
     base_telemetry = _base_telemetry(client)
@@ -682,20 +753,17 @@ def handle_periodic_tasks(client, actuator, device_id, token, last_hb_ms, next_s
         client.note_heartbeat_status(st, flush_device_id=device_id, flush_token=token)
         next_sleep = _next_sleep_from_obj(client.cfg, obj, next_sleep)
         last_hb_ms = client.hal.ticks_ms()
-        if getattr(client, "debug", 1) >= 1:
-            try:
-                print(
-                    "HB:",
-                    st,
-                    "next:",
-                    next_sleep,
-                    "failures:",
-                    client.runtime_state.get("heartbeat_failures", 0),
-                    "offline_queued:",
-                    bool(client.runtime_state.get("device_offline_queued", False)),
-                )
-            except Exception:
-                pass
+        _log_debug(
+            client,
+            "[heartbeat] status=",
+            st,
+            "next=",
+            next_sleep,
+            "failures=",
+            client.runtime_state.get("heartbeat_failures", 0),
+            "offline_queued=",
+            bool(client.runtime_state.get("device_offline_queued", False)),
+        )
 
     return last_hb_ms, next_sleep
 

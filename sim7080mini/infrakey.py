@@ -20,9 +20,17 @@ class InfrakeyClient:
     def __init__(self, cfg: dict, debug=1):
         self.cfg = cfg
         self.debug = debug
+        runtime = cfg.get("runtime", {})
+        base_debug = _safe_int(debug, 0)
+        self.operational_debug = bool(
+            runtime.get("debug_operational_enabled", base_debug >= 1)
+        )
+        self.modem_debug = base_debug if bool(
+            runtime.get("debug_modem_enabled", base_debug >= 2)
+        ) else 0
         hw = cfg.get("hardware", {})
         self.hal = make_hal(
-            debug=debug,
+            debug=self.modem_debug,
             uart_port=hw.get("uart_port", 0),
             baud=hw.get("baud", 115200),
             led_pin=hw.get("led_pin", 25),
@@ -30,7 +38,7 @@ class InfrakeyClient:
             uart_tx_pin=hw.get("uart_tx_pin"),
             uart_rx_pin=hw.get("uart_rx_pin"),
         )
-        self.modem = SIM7080(self.hal, nb_band=cfg["nb_band"], tls_ctx=0, sock_id=0, debug=debug)
+        self.modem = SIM7080(self.hal, nb_band=cfg["nb_band"], tls_ctx=0, sock_id=0, debug=self.modem_debug)
         self.http = HttpClient(
             self.modem,
             host=cfg["host"],
@@ -64,11 +72,30 @@ class InfrakeyClient:
         }
 
     def _log(self, *args):
-        if self.debug:
+        if self.operational_debug:
             try:
                 print(*args)
             except Exception:
                 pass
+
+    def _trace_api_request(self, method, path, payload=None):
+        if not self.operational_debug:
+            return
+        try:
+            if payload is None:
+                print("[api>>]", method, path)
+            else:
+                print("[api>>]", method, path, payload)
+        except Exception:
+            pass
+
+    def _trace_api_response(self, method, path, status, op_name):
+        if not self.operational_debug:
+            return
+        try:
+            print("[api<<]", method, path, "status=", status, "op=", op_name)
+        except Exception:
+            pass
 
     # persistencia
     def _load_token(self):
@@ -282,10 +309,12 @@ class InfrakeyClient:
             body["longitude"] = location["longitude"]
         if self.debug:
             self._log("[claim] payload=", body)
+        self._trace_api_request("POST", "/api/v1/devices/claim", body)
         status, obj, dbg = self._request_with_retry(
             lambda: self.http.post_json("/api/v1/devices/claim", body),
             "claim",
         )
+        self._trace_api_response("POST", "/api/v1/devices/claim", status, "claim")
         if status in (200, 201) and obj and "device_id" in obj and "auth_token" in obj:
             self._save_token(obj["device_id"], obj["auth_token"])
             self.device_id = obj["device_id"]
@@ -298,10 +327,13 @@ class InfrakeyClient:
         return None, None
 
     def health(self):
-        return self._request_with_retry(
+        self._trace_api_request("GET", "/api/v1/health")
+        result = self._request_with_retry(
             lambda: self.http.get_json("/api/v1/health"),
             "health",
         )
+        self._trace_api_response("GET", "/api/v1/health", result[0], "health")
+        return result
 
     def heartbeat(self, device_id, auth_token, battery_v=None, battery_pct=None, latitude=None, longitude=None, extra=None):
         body = {
@@ -328,15 +360,21 @@ class InfrakeyClient:
         def _send(req_device_id, req_token):
             headers["Authorization"] = "Bearer {}".format(req_token)
             path = "/api/v1/devices/{}/heartbeat".format(req_device_id)
-            if self.debug:
-                self._log(path, body)
+            self._trace_api_request("POST", path, body)
             return self.http.post_json(path, body, headers=headers)
-        return self._authorized_request(
+        result = self._authorized_request(
             "heartbeat",
             _send,
             device_id=device_id,
             auth_token=auth_token,
         )
+        self._trace_api_response(
+            "POST",
+            "/api/v1/devices/{}/heartbeat".format(device_id),
+            result[0],
+            "heartbeat",
+        )
+        return result
 
     # events / snapshot / ack
     def queue_event(self, status, severity, event_id, ts=None, extra=None):
@@ -349,6 +387,11 @@ class InfrakeyClient:
 
     def flush_event_outbox(self, device_id, auth_token, max_n=5):
         def _sender(record):
+            self._trace_api_request(
+                "POST",
+                "/api/v1/devices/{}/events".format(device_id),
+                record,
+            )
             status, obj, dbg = self._authorized_request(
                 "event_outbox",
                 lambda req_device_id, req_token: self.http.post_json(
@@ -358,6 +401,12 @@ class InfrakeyClient:
                 ),
                 device_id=device_id,
                 auth_token=auth_token,
+            )
+            self._trace_api_response(
+                "POST",
+                "/api/v1/devices/{}/events".format(device_id),
+                status,
+                "event_outbox",
             )
             return status in (200, 201)
 
@@ -421,6 +470,17 @@ class InfrakeyClient:
             device_id=device_id,
             auth_token=auth_token,
         )
+        self._trace_api_request(
+            "POST",
+            "/api/v1/devices/{}/events".format(device_id),
+            body,
+        )
+        self._trace_api_response(
+            "POST",
+            "/api/v1/devices/{}/events".format(device_id),
+            result[0],
+            "event",
+        )
         if queue_on_fail and result[0] not in (200, 201):
             try:
                 self.queue_event(status=status, severity=severity, event_id=event_id, ts=ts, extra=extra)
@@ -431,9 +491,12 @@ class InfrakeyClient:
         return result
 
     def send_snapshot(self, device_id, auth_token, snapshot_dict):
-        if self.debug:
-            self._log("[snapshot] payload=", snapshot_dict)
-        return self._authorized_request(
+        self._trace_api_request(
+            "POST",
+            "/api/v1/devices/{}/events/snapshot".format(device_id),
+            snapshot_dict,
+        )
+        result = self._authorized_request(
             "snapshot",
             lambda req_device_id, req_token: self.http.post_json(
                 "/api/v1/devices/{}/events/snapshot".format(req_device_id),
@@ -443,12 +506,24 @@ class InfrakeyClient:
             device_id=device_id,
             auth_token=auth_token,
         )
+        self._trace_api_response(
+            "POST",
+            "/api/v1/devices/{}/events/snapshot".format(device_id),
+            result[0],
+            "snapshot",
+        )
+        return result
 
     def ack_command(self, device_id, auth_token, cmd_id, ack_at=None, notes=""):
         body = {"notes": notes}
         if ack_at is not None:
             body["ack_at"] = ack_at
-        return self._authorized_request(
+        self._trace_api_request(
+            "POST",
+            "/api/v1/devices/{}/commands/{}/ack".format(device_id, cmd_id),
+            body,
+        )
+        result = self._authorized_request(
             "ack",
             lambda req_device_id, req_token: self.http.post_json(
                 "/api/v1/devices/{}/commands/{}/ack".format(req_device_id, cmd_id),
@@ -458,3 +533,10 @@ class InfrakeyClient:
             device_id=device_id,
             auth_token=auth_token,
         )
+        self._trace_api_response(
+            "POST",
+            "/api/v1/devices/{}/commands/{}/ack".format(device_id, cmd_id),
+            result[0],
+            "ack",
+        )
+        return result

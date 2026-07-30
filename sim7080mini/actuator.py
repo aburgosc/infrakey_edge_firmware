@@ -3,7 +3,7 @@
 # - Modo "relay": 1 pin (pulso) o 2 pines (open/close).
 # - Modo "servo": PWM 50Hz (open_us / close_us), con drive_ms para soltar pulso.
 # Sensor digital:
-# - Si se define "sensor_pin", usa 0/1 con debounce para estado y tamper forzado.
+# - Si se define "sensor_pin", usa 0/1 con debounce para estado y seguridad.
 # - Si no, mantiene compatibilidad con "tamper_pin" (activo alto/bajo).
 
 try:
@@ -36,9 +36,6 @@ class _EdgeDebouncer:
         self._candidate_since = _ticks_ms()
 
     def edge(self):
-        """
-        Devuelve (changed:bool, new_val:int|None) con debounce.
-        """
         now = _ticks_ms()
         v = 1 if self._read() else 0
         if v != self._candidate:
@@ -57,27 +54,15 @@ class _EdgeDebouncer:
 
 
 class _ServoDriver:
-    """
-    Driver PWM generico. Intenta usar hal.pwm_out; fallback a machine.PWM si existe.
-    Requiere:
-      - .freq(hz)
-      - .duty_u16(val)
-      - .deinit()
-    """
     def __init__(self, hal, pin, freq_hz=50):
-        self._hal = hal
         self._pwm = None
-        self._using_hal = False
 
-        # 1) HAL con PWM, si existe
         try:
             if hasattr(hal, "pwm_out"):
                 self._pwm = hal.pwm_out(pin, freq_hz=freq_hz)
-                self._using_hal = True
         except Exception:
             self._pwm = None
 
-        # 2) Fallback: machine.PWM
         if self._pwm is None:
             try:
                 import machine
@@ -109,19 +94,14 @@ class _ServoDriver:
 
     def pulse_us(self, us):
         duty = self.duty_from_us(us)
-        # compatibilidad para ambos PWM
         if hasattr(self._pwm, "duty_u16"):
             self._pwm.duty_u16(duty)
-        else:
-            # si el HAL expone otra API, intenta duty16/duty
-            if hasattr(self._pwm, "duty16"):
-                self._pwm.duty16(duty)
-            elif hasattr(self._pwm, "duty"):
-                # duty (0..1023) aproximado
-                self._pwm.duty(int(duty * 1023 // 65535))
+        elif hasattr(self._pwm, "duty16"):
+            self._pwm.duty16(duty)
+        elif hasattr(self._pwm, "duty"):
+            self._pwm.duty(int(duty * 1023 // 65535))
 
     def idle(self):
-        # poner duty=0 si soporta
         try:
             if hasattr(self._pwm, "duty_u16"):
                 self._pwm.duty_u16(0)
@@ -144,30 +124,16 @@ class Actuator:
     """
     API estable usada por handlers/main:
 
-      open() / close()
-      tamper_triggered() -> bool  (apertura forzada)
-
-    Modos de operacion:
-
-    - RELAY (por defecto, compat):
-        "actuator_pin" (+ "actuator_active_high", "actuator_pulse_ms")
-        o "open_pin"/"close_pin" (doble rele).
-
-    - SERVO:
-        "servo_pwm_pin": 20,
-        "servo_freq": 50,
-        "servo_open_us": 2300,
-        "servo_close_us": 700,
-        "servo_drive_ms": 500
-
-    Sensor de estado:
-      Preferente: "sensor_pin", "sensor_open_is", "sensor_pull", "sensor_debounce_ms"
-      Compat: "tamper_pin", "tamper_pull", "tamper_active_high"
+      open() / close() / pulse()
+      tamper_triggered() -> bool
+      poll_transition() -> dict|None
+      state_snapshot() -> dict
     """
+
     def __init__(self, hal, gpio_cfg: dict):
         self.hal = hal
         self.cfg = gpio_cfg or {}
-        self._mode = self.cfg.get("mode", None)  # "relay" | "servo" | None(auto)
+        self._mode = self.cfg.get("mode", None)
         self._last_cmd = "close"
         self._authorized_open_at_ms = None
         self._authorized_open_window_ms = max(
@@ -182,18 +148,20 @@ class Actuator:
         self._boot_open_pending = False
         self._last_tamper_reason = None
         self._tamper_replay_pending = False
+        self._pending_transitions = []
+        self._authorized_open_reported = False
+        self._actuator_state = "unknown"
+        self._door_state = "unknown"
+        self._security_state = "unknown"
 
-        # --- Detectar modo ---
         use_servo = False
         if self._mode == "servo":
             use_servo = True
         elif self._mode == "relay":
             use_servo = False
         else:
-            # auto: si hay servo_pwm_pin -> servo, si no -> relay
             use_servo = ("servo_pwm_pin" in self.cfg)
 
-        # --- Salidas ---
         if use_servo:
             sv_pin = int(self.cfg.get("servo_pwm_pin", 20))
             sv_freq = int(self.cfg.get("servo_freq", 50))
@@ -203,7 +171,6 @@ class Actuator:
             self._servo = _ServoDriver(hal, sv_pin, freq_hz=sv_freq)
             self._is_relay = False
         else:
-            # Relay simple o doble (compat)
             self._is_relay = True
             self._single = "actuator_pin" in self.cfg and "open_pin" not in self.cfg
             self._pulse_ms = int(self.cfg.get("actuator_pulse_ms", 300))
@@ -215,16 +182,13 @@ class Actuator:
                     initial=False,
                 )
             else:
-                # doble rele
                 self._open_pin = hal.pin_out(self.cfg["open_pin"], active_high=True, initial=False)
                 self._close_pin = hal.pin_out(self.cfg["close_pin"], active_high=True, initial=False)
 
-        # --- Sensor / Tamper ---
         self._has_sensor = "sensor_pin" in self.cfg
         if self._has_sensor:
-            # Nuevo: sensor de puerta con 0/1 y debounce
             pin = int(self.cfg.get("sensor_pin", 15))
-            pull = self.cfg.get("sensor_pull", None)   # "up" | "down" | None
+            pull = self.cfg.get("sensor_pull", None)
             self._sensor_open_is = 1 if int(self.cfg.get("sensor_open_is", 1)) else 0
             db = int(self.cfg.get("sensor_debounce_ms", 60))
             self._sensor = hal.pin_in(pin, pull=pull)
@@ -232,18 +196,21 @@ class Actuator:
             self._boot_open_pending = bool(
                 self._alert_if_open_on_boot and self.is_open()
             )
+            if self.is_open():
+                self._door_state = "open"
+                self._security_state = "unknown"
+            else:
+                self._door_state = "closed"
+                self._security_state = "locked"
         else:
-            # Compat: tamper pin (booleano activo alto/bajo)
             self._tamper = hal.pin_in(self.cfg["tamper_pin"], pull=self.cfg.get("tamper_pull", "up"))
             self._tamper_active_high = bool(self.cfg.get("tamper_active_high", True))
 
-    # ------------- Relay helpers -------------
     def _pulse(self, pinobj, ms):
         pinobj.on()
         self.hal.sleep_ms(ms)
         pinobj.off()
 
-    # ------------- API publica -------------
     def _sensor_raw_is_open(self):
         if not self._has_sensor:
             return False
@@ -259,41 +226,99 @@ class Actuator:
     def _arm_open_authorization(self):
         if not self._has_sensor:
             return False
-        # Una orden remota no debe autorizar retrospectivamente una puerta
-        # que ya estaba abierta antes de ejecutar el actuador.
-        if self._sensor_raw_is_open():
-            self._clear_open_authorization()
-            return False
         self._authorized_open_at_ms = _ticks_ms()
         return True
 
-    def _consume_open_authorization(self, now_ms):
-        armed_at = self._authorized_open_at_ms
-        if armed_at is None:
-            return False
-        age_ms = _ticks_diff(now_ms, armed_at)
-        self._clear_open_authorization()
-        return 0 <= age_ms <= self._authorized_open_window_ms
+    def _make_transition(self, kind, reason=None):
+        return {
+            "kind": kind,
+            "reason": reason,
+            "actuator_state": self._actuator_state,
+            "door_state": self._door_state,
+            "security_state": self._security_state,
+            "at_ms": _ticks_ms(),
+        }
+
+    def _handle_sensor_edge(self, new_val):
+        opened = (new_val == self._sensor_open_is)
+        self._boot_open_pending = False
+
+        if opened:
+            self._door_state = "open"
+            if self._security_state == "unlocked_authorized":
+                self._last_tamper_reason = None
+                if not self._authorized_open_reported:
+                    self._authorized_open_reported = True
+                    return self._make_transition("door_opened_authorized")
+                return None
+
+            self._last_tamper_reason = "door_forced"
+            return self._make_transition("door_forced_open", reason="door_forced")
+
+        self._door_state = "closed"
+        self._security_state = "locked"
+        self._authorized_open_reported = False
+        self._last_tamper_reason = None
+        return self._make_transition("door_closed")
+
+    def poll_transition(self):
+        if self._pending_transitions:
+            return self._pending_transitions.pop(0)
+
+        if self._has_sensor:
+            changed, new_val = self._sensor_db.edge()
+            if changed and new_val is not None:
+                transition = self._handle_sensor_edge(new_val)
+                if transition is not None:
+                    return transition
+
+            now_ms = _ticks_ms()
+            if (
+                self._boot_open_pending
+                and _ticks_diff(now_ms, self._boot_at_ms) >= self._boot_grace_ms
+            ):
+                self._boot_open_pending = False
+                if self._sensor_raw_is_open():
+                    self._door_state = "open"
+                    self._security_state = "unknown"
+                    self._last_tamper_reason = "open_on_boot_unknown"
+                    return self._make_transition(
+                        "door_open_on_boot_unknown",
+                        reason="open_on_boot_unknown",
+                    )
+            return None
+
+        val = 1 if self._tamper.read() else 0
+        triggered = bool(val) if self._tamper_active_high else not bool(val)
+        if triggered:
+            self._last_tamper_reason = "tamper_level"
+            return self._make_transition("tamper_level", reason="tamper_level")
+        return None
 
     def wait_for_authorized_open(self, poll_ms=25):
-        """
-        Observa el sensor durante la ventana autorizada antes de iniciar I/O de red.
-
-        Devuelve True si se confirmo el flanco, False si vencio sin apertura y
-        None cuando no hay sensor o la orden no pudo armar una autorizacion.
-        """
-        if not self._has_sensor or self._authorized_open_at_ms is None:
+        if not self._has_sensor or self._security_state != "unlocked_authorized":
             return None
+        if self._sensor_raw_is_open():
+            self._door_state = "open"
+            self._authorized_open_reported = True
+            return True
         poll_ms = max(5, int(poll_ms))
-        while self._authorized_open_at_ms is not None:
-            if self.tamper_triggered():
-                # El handler aun debe publicar este flanco como evento.
-                self._tamper_replay_pending = True
+        max_wait_ms = self._authorized_open_window_ms
+        started_at = _ticks_ms()
+        while True:
+            transition = self.poll_transition()
+            if transition:
+                kind = transition.get("kind")
+                if kind == "door_opened_authorized":
+                    return True
+                if kind in ("door_forced_open", "door_open_on_boot_unknown"):
+                    self._pending_transitions.insert(0, transition)
+                    self._tamper_replay_pending = True
+                    self._last_tamper_reason = transition.get("reason")
+                    return False
+            if max_wait_ms > 0 and _ticks_diff(_ticks_ms(), started_at) >= max_wait_ms:
                 return False
-            if self._authorized_open_at_ms is None:
-                return bool(self.is_open())
             self.hal.sleep_ms(poll_ms)
-        return False
 
     def open(self):
         armed = self._arm_open_authorization()
@@ -304,7 +329,6 @@ class Actuator:
                 else:
                     self._pulse(self._open_pin, self._pulse_ms)
             else:
-                # Servo
                 self._servo.pulse_us(self._sv_open_us)
                 if self._sv_drive_ms > 0:
                     self.hal.sleep_ms(self._sv_drive_ms)
@@ -314,6 +338,13 @@ class Actuator:
                 self._clear_open_authorization()
             raise
         self._last_cmd = "open"
+        self._actuator_state = "unlock_commanded"
+        self._security_state = "unlocked_authorized"
+        if self._has_sensor and self._sensor_raw_is_open():
+            self._door_state = "open"
+            self._authorized_open_reported = True
+        else:
+            self._authorized_open_reported = bool(self._door_state == "open")
 
     def close(self):
         self._clear_open_authorization()
@@ -323,12 +354,17 @@ class Actuator:
             else:
                 self._pulse(self._close_pin, self._pulse_ms)
         else:
-            # Servo
             self._servo.pulse_us(self._sv_close_us)
             if self._sv_drive_ms > 0:
                 self.hal.sleep_ms(self._sv_drive_ms)
                 self._servo.idle()
         self._last_cmd = "close"
+        self._actuator_state = "lock_commanded"
+        self._authorized_open_reported = False
+        if self._has_sensor:
+            self._security_state = "locking_pending"
+        else:
+            self._security_state = "locked"
 
     def pulse(self, ms=500):
         ms = int(ms)
@@ -352,8 +388,10 @@ class Actuator:
                 self._clear_open_authorization()
             raise
         self._last_cmd = "close"
+        self._actuator_state = "lock_commanded"
+        self._security_state = "locked"
+        self._authorized_open_reported = False
 
-    # Estado abierto/cerrado solo si hay sensor explicito
     def is_open(self):
         if not self._has_sensor:
             return None
@@ -361,55 +399,30 @@ class Actuator:
         return 1 if val == self._sensor_open_is else 0
 
     def tamper_triggered(self) -> bool:
-        """
-        Modo sensor:
-          True ante apertura sin autorizacion vigente o si arranca abierto.
-        Modo tamper compat:
-          Lee el pin tamper con activo alto/bajo.
-        """
-        if self._has_sensor:
-            if self._tamper_replay_pending:
-                self._tamper_replay_pending = False
-                return True
-            now_ms = _ticks_ms()
-            armed_at = self._authorized_open_at_ms
-            if armed_at is not None:
-                age_ms = _ticks_diff(now_ms, armed_at)
-                if age_ms < 0 or age_ms > self._authorized_open_window_ms:
-                    self._clear_open_authorization()
+        if self._tamper_replay_pending:
+            self._tamper_replay_pending = False
+            return True
 
-            changed, new_val = self._sensor_db.edge()
-            if changed and new_val is not None:
-                opened = (new_val == self._sensor_open_is)
-                if opened:
-                    if self._consume_open_authorization(now_ms):
-                        self._last_tamper_reason = None
-                        return False
-                    self._last_tamper_reason = "door_forced"
-                    self._boot_open_pending = False
-                    return True
-                # El cierre cancela cualquier permiso que no haya sido usado.
-                self._clear_open_authorization()
-                self._boot_open_pending = False
-
-            if (
-                self._boot_open_pending
-                and _ticks_diff(now_ms, self._boot_at_ms) >= self._boot_grace_ms
-            ):
-                self._boot_open_pending = False
-                if self._sensor_raw_is_open():
-                    self._last_tamper_reason = "door_open_on_boot"
-                    return True
+        transition = self.poll_transition()
+        if not transition:
             return False
-        else:
-            val = 1 if self._tamper.read() else 0
-            triggered = bool(val) if self._tamper_active_high else not bool(val)
-            if triggered:
-                self._last_tamper_reason = "tamper_level"
-            return triggered
+
+        kind = transition.get("kind")
+        if kind in ("door_forced_open", "door_open_on_boot_unknown", "tamper_level"):
+            self._last_tamper_reason = transition.get("reason")
+            return True
+        return False
 
     def last_tamper_reason(self):
         return self._last_tamper_reason
+
+    def state_snapshot(self):
+        return {
+            "actuator_state": self._actuator_state,
+            "door_state": self._door_state,
+            "security_state": self._security_state,
+            "last_cmd": self._last_cmd,
+        }
 
     def deinit(self):
         if not self._is_relay:
@@ -417,5 +430,3 @@ class Actuator:
                 self._servo.deinit()
             except Exception:
                 pass
-
-
