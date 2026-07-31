@@ -110,6 +110,25 @@ def _collect_gc():
             pass
 
 
+def _log_exception(label, exc):
+    try:
+        print(label, repr(exc))
+    except Exception:
+        pass
+    try:
+        if hasattr(sys, "print_exception"):
+            sys.print_exception(exc)
+    except Exception:
+        pass
+
+
+def _catch_base_exceptions_enabled(cfg):
+    try:
+        return bool(cfg.get("runtime", {}).get("supervisor_catch_base_exceptions", True))
+    except Exception:
+        return True
+
+
 def _sleep_ms(ms):
     try:
         _time.sleep_ms(int(ms))
@@ -156,7 +175,24 @@ def _run_session():
         return False
 
     if runtime.get("healthcheck_on_startup", True):
-        h_st, h_obj, h_dbg = client.health()
+        try:
+            h_st, h_obj, h_dbg = client.health()
+        except Exception as exc:
+            _log_exception("[health] exception=", exc)
+            h_st, h_obj, h_dbg = 0, None, "exception:{}".format(repr(exc))
+            try:
+                client.recover_connectivity(restart_modem=False)
+            except Exception as rec_exc:
+                _log_exception("[health] recovery exception=", rec_exc)
+        except BaseException as exc:
+            _log_exception("[health] base-exception=", exc)
+            if not _catch_base_exceptions_enabled(cfg):
+                raise
+            h_st, h_obj, h_dbg = 0, None, "base-exception:{}".format(repr(exc))
+            try:
+                client.recover_connectivity(restart_modem=False)
+            except BaseException as rec_exc:
+                _log_exception("[health] recovery base-exception=", rec_exc)
         if h_st in (200, 201):
             print("[health] ok status=", h_st)
         if h_st not in (200, 201):
@@ -165,7 +201,24 @@ def _run_session():
                 print("[supervisor] healthcheck bloquea arranque; se reintentara")
                 return False
 
-    device_id, token = client.claim_if_needed()
+    try:
+        device_id, token = client.claim_if_needed()
+    except Exception as exc:
+        _log_exception("[claim] exception=", exc)
+        try:
+            client.recover_connectivity(restart_modem=False)
+        except Exception as rec_exc:
+            _log_exception("[claim] recovery exception=", rec_exc)
+        return False
+    except BaseException as exc:
+        _log_exception("[claim] base-exception=", exc)
+        if not _catch_base_exceptions_enabled(cfg):
+            raise
+        try:
+            client.recover_connectivity(restart_modem=False)
+        except BaseException as rec_exc:
+            _log_exception("[claim] recovery base-exception=", rec_exc)
+        return False
     if not (device_id and token):
         print("No se obtuvo token/device_id. Abortando.")
         return False
@@ -174,10 +227,26 @@ def _run_session():
     print("[claim] ok device_id=", device_id)
 
     battery_v, battery_pct = _read_battery_metrics(client)
-    st, obj, dbg = client.heartbeat(device_id, token, battery_v=battery_v, battery_pct=battery_pct)
+    try:
+        st, obj, dbg = client.heartbeat(device_id, token, battery_v=battery_v, battery_pct=battery_pct)
+    except Exception as exc:
+        _log_exception("[heartbeat] startup exception=", exc)
+        try:
+            client.modem.socket_close()
+        except Exception:
+            pass
+        st, obj, dbg = 0, None, "exception:{}".format(repr(exc))
+    except BaseException as exc:
+        _log_exception("[heartbeat] startup base-exception=", exc)
+        if not _catch_base_exceptions_enabled(cfg):
+            raise
+        try:
+            client.modem.socket_close()
+        except BaseException:
+            pass
+        st, obj, dbg = 0, None, "base-exception:{}".format(repr(exc))
     device_id, token = client.current_credentials(device_id, token)
     client.note_heartbeat_status(st, flush_device_id=device_id, flush_token=token)
-
     next_sleep = _safe_next_sleep(cfg, obj, cfg.get("heartbeat_interval_sec", 86400))
     print("[heartbeat] startup status=", st, "next_pull_sec=", next_sleep)
     last_hb_ms = client.hal.ticks_ms()
@@ -359,9 +428,20 @@ def _run_session():
                 client.hal.sleep_ms(loop_sleep_ms)
             except Exception as exc:
                 print("[loop] error:", exc)
+                _log_exception("[loop] exception=", exc)
                 try:
                     print("[pipeline] stats:", pipeline.stats())
                 except Exception:
+                    pass
+                _collect_gc()
+                client.hal.sleep_ms(loop_error_backoff_ms)
+            except BaseException as exc:
+                _log_exception("[loop] base-exception=", exc)
+                if not _catch_base_exceptions_enabled(cfg):
+                    raise
+                try:
+                    print("[pipeline] stats:", pipeline.stats())
+                except BaseException:
                     pass
                 _collect_gc()
                 client.hal.sleep_ms(loop_error_backoff_ms)
@@ -389,8 +469,17 @@ def main():
             else:
                 last_reason = "startup_retry"
         except Exception as exc:
-            print("[supervisor] fatal:", exc)
+            _log_exception("[supervisor] fatal=", exc)
             last_reason = "fatal_exception"
+        except BaseException as exc:
+            _log_exception("[supervisor] base-fatal=", exc)
+            try:
+                cfg = load_config("device_config.json")
+            except Exception:
+                cfg = {}
+            if not _catch_base_exceptions_enabled(cfg):
+                raise
+            last_reason = "base_exception"
         _collect_gc()
         cfg = load_config("device_config.json")
         delay_ms = _bounded_sleep(cfg.get("runtime", {}).get("supervisor_restart_delay_ms", 5000), 5000)

@@ -4,6 +4,10 @@ except Exception:
     import json
 import os
 try:
+    import sys as _sys
+except Exception:
+    _sys = None
+try:
     import gc as _gc
 except Exception:
     _gc = None
@@ -49,6 +53,7 @@ class InfrakeyClient:
             port=cfg["port"],
             user_agent=cfg["user_agent"],
             connect_host=cfg.get("connect_host"),
+            open_timeout_ms=max(5000, _safe_int(cfg.get("runtime", {}).get("http_open_timeout_ms", 45000), 45000)),
         )
         self.token_file = cfg["files"]["token"]
         self.model = cfg["model"]
@@ -57,6 +62,13 @@ class InfrakeyClient:
         self.longitude = cfg["longitude"]
         self.http_retry_count = max(1, _safe_int(cfg.get("http_retry_count", 2), 2))
         self.http_retry_backoff_ms = max(0, _safe_int(cfg.get("http_retry_backoff_ms", 1200), 1200))
+        try:
+            self.modem.READ_TIMEOUT = max(
+                5000,
+                _safe_int(cfg.get("runtime", {}).get("http_read_timeout_ms", 20000), 20000),
+            )
+        except Exception:
+            pass
         self.device_id = None
         self.auth_token = None
         outbox_path = cfg.get("files", {}).get("outbox", "outbox.jsonl")
@@ -273,6 +285,18 @@ class InfrakeyClient:
                 except Exception:
                     pass
                 last = (0, None, "exception:{}".format(repr(exc)))
+            except BaseException as exc:
+                self._log("[http]", op_name, "base-exception attempt=", attempt, "err=", repr(exc))
+                try:
+                    if _sys and hasattr(_sys, "print_exception"):
+                        _sys.print_exception(exc)
+                except Exception:
+                    pass
+                try:
+                    self.modem.socket_close()
+                except Exception:
+                    pass
+                last = (0, None, "base-exception:{}".format(repr(exc)))
             status = last[0]
             if status in (200, 201, 202, 204):
                 return last

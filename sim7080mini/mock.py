@@ -179,7 +179,7 @@ class SIM7080Modem:
     def write_at_only(self, data):
         return True
 
-    def http_post_json_return(self, host, port, user_agent, path, body_dict, extra_headers=None, connect_host=None):
+    def http_post_json_return(self, host, port, user_agent, path, body_dict, extra_headers=None, connect_host=None, open_timeout_ms=None):
         req = "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\n\r\n{}".format(
             path,
             host,
@@ -189,7 +189,7 @@ class SIM7080Modem:
         reply = self._http_reply_for_request(req)
         return self._parse_http_reply(reply)
 
-    def http_get_json_return(self, host, port, user_agent, path, extra_headers=None, connect_host=None):
+    def http_get_json_return(self, host, port, user_agent, path, extra_headers=None, connect_host=None, open_timeout_ms=None):
         req = "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\n\r\n".format(
             path,
             host,

@@ -381,17 +381,23 @@ class SIM7080:
         self.hal.send_at('+CSSLCFG="CTXINDEX",{}'.format(self.TLS_CTX), "OK", 2000)
 
     def _bind_tls_socket(self):
-        ok_ctx, _ = self.hal.send_at(
+        ok_ctx, r_ctx = self.hal.send_at(
             '+CASSLCFG={},"CRINDEX",{}'.format(self.SOCK_ID, self.TLS_CTX),
             "OK",
             2000,
         )
+        if not ok_ctx:
+            _log_debug(
+                self.debug,
+                "[tls] CRINDEX no confirmado; continuando con CSSLCFG CTXINDEX:",
+                repr(r_ctx or ""),
+            )
         ok_ssl, _ = self.hal.send_at(
             '+CASSLCFG={},"SSL",1'.format(self.SOCK_ID),
             "OK",
             2000,
         )
-        return bool(ok_ctx and ok_ssl)
+        return bool(ok_ssl)
 
     def _explain_caopen_err(self, code):
         table = {
@@ -456,9 +462,13 @@ class SIM7080:
         return False
 
     def _handle_caopen_error(self, rc, host, port, target):
-        if rc not in (2, 27):
+        if rc not in (1, 2, 27):
             return False
-        if rc == 2:
+        if rc == 1:
+            _log_debug(self.debug, "[sock] rc=1 socket error; cerrando CID y revalidando PDP")
+            self._close_socket_and_wait_closed(close_timeout_ms=4000, wait_closed_ms=3000, settle_ms=800)
+            self._ensure_socket_context_ready(settle_ms=2000)
+        elif rc == 2:
             _log_debug(self.debug, "[sock] rc=2 sin memoria; liberando CID y esperando modem")
             self._close_socket_and_wait_closed(close_timeout_ms=4000, wait_closed_ms=4000, settle_ms=1200)
             self.hal.sleep_ms(3000)
@@ -541,9 +551,10 @@ class SIM7080:
                 return True
 
         # Último recurso: CASTATE?
-        _log_debug(self.debug, "[sock] Revisando CASTATE? (último recurso)")
+        _log_debug(self.debug, "[sock] Revisando CASTATE? (ultimo recurso breve)")
         t1 = self.hal.ticks_ms()
-        while self.hal.ticks_diff(self.hal.ticks_ms(), t1) < timeout_ms:
+        castate_timeout_ms = min(timeout_ms, 6000)
+        while self.hal.ticks_diff(self.hal.ticks_ms(), t1) < castate_timeout_ms:
             ok3, r = self.hal.send_at("+CASTATE?", "OK", 1200)
             if ok3:
                 for ln in r.splitlines():
@@ -557,6 +568,7 @@ class SIM7080:
                         except Exception:
                             pass
             self.hal.sleep_ms(150)
+        self._close_socket_and_wait_closed(close_timeout_ms=4000, wait_closed_ms=1500, settle_ms=500)
         _log_debug(self.debug, "[sock] No se pudo abrir socket TLS")
         return False
 
@@ -721,7 +733,7 @@ class SIM7080:
 
         return status, headers_map, body_txt, acc
 
-    def http_post_json_return(self, host, port, user_agent, path, body_dict, extra_headers=None, connect_host=None):
+    def http_post_json_return(self, host, port, user_agent, path, body_dict, extra_headers=None, connect_host=None, open_timeout_ms=None):
         body = json.dumps(body_dict)
         hdrs = {"Content-Type": "application/json", "Content-Length": str(len(body))}
         if extra_headers:
@@ -729,7 +741,8 @@ class SIM7080:
         header_str = self._build_headers(host, user_agent, hdrs)
         req = "POST {} HTTP/1.0\r\n{}\r\n{}".format(path, header_str, body)
 
-        if not self.socket_open(host, port, connect_host=connect_host):
+        if not self.socket_open(host, port, timeout_ms=open_timeout_ms or 45000, connect_host=connect_host):
+            self.socket_close()
             return 0, None, ""
         if not self.socket_send(req):
             self.socket_close(); return 0, None, ""
@@ -745,14 +758,15 @@ class SIM7080:
                 obj = None
         return status, obj, body_txt
 
-    def http_get_json_return(self, host, port, user_agent, path, extra_headers=None, connect_host=None):
+    def http_get_json_return(self, host, port, user_agent, path, extra_headers=None, connect_host=None, open_timeout_ms=None):
         hdrs = {}
         if extra_headers:
             hdrs.update(extra_headers)
         header_str = self._build_headers(host, user_agent, hdrs)
         req = "GET {} HTTP/1.0\r\n{}\r\n".format(path, header_str)
 
-        if not self.socket_open(host, port, connect_host=connect_host):
+        if not self.socket_open(host, port, timeout_ms=open_timeout_ms or 45000, connect_host=connect_host):
+            self.socket_close()
             return 0, None, ""
         if not self.socket_send(req):
             self.socket_close()
