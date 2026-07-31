@@ -56,6 +56,7 @@ DEFAULT = {
         "max_command_queue": 32,
         "loop_sleep_ms": 100,
         "loop_error_backoff_ms": 500,
+        "supervisor_restart_delay_ms": 5000,
         "status_log_interval_sec": 30,
         "ws_pull_max": 10,
         "ws_queue_max": 32,
@@ -63,6 +64,7 @@ DEFAULT = {
         "legacy_import_batch": 1,
         "outbox_flush_max": 5,
         "offline_after_heartbeat_failures": 3,
+        "heartbeat_failure_retry_sec": 60,
         "healthcheck_on_startup": True,
         "healthcheck_timeout_fail_open": True,
         "journal_state_save_every": 1,
@@ -75,6 +77,10 @@ DEFAULT = {
         "ws_reconnect_delay_ms": 5000,
         "ws_idle_timeout_ms": 90000,
         "ws_confirm_timeout_ms": 12000,
+        "ws_reconnect_fail_reset_threshold": 3,
+        "ws_reconnect_fail_modem_reset_threshold": 6,
+        "ws_down_heartbeat_sec": 0,
+        "heartbeat_effective_max_sec": 0,
         "ws_identifier_include_device_id": False,
         "ws_token_in_query": False,
         "tamper_repeat_suppress_ms": 15000,
@@ -102,6 +108,7 @@ DEFAULT = {
         "poll_attempts": 2,
         "poll_interval_ms": 1000,
         "cache_ms": 15000,
+        "allow_stale_cache": True,
     },
     "hardware": {
         "uart_port": 0,
@@ -192,7 +199,7 @@ def _persistable_config(cfg):
     return data
 
 
-def save_config(cfg: dict, path="device_config.json"):
+def save_config(cfg, path="device_config.json"):
     tmp = path + ".tmp"
     bak = path + ".bak"
     try:

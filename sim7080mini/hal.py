@@ -90,7 +90,7 @@ class MockHAL:
             if self.debug >= 2:
                 print("[mock PWM] pin={} deinit".format(self.pin_no))
 
-    def set_sock_id(self, cid:int): self.current_sock_id = int(cid)
+    def set_sock_id(self, cid): self.current_sock_id = int(cid)
 
     def blink(self, n=2, t=0.12):
         if self.debug: print(f"[mock] blink x{n}")
@@ -122,7 +122,7 @@ class MockHAL:
         except Exception:
             pass
 
-    def write_raw(self, data: bytes):
+    def write_raw(self, data):
         self.m.socket_send(data, wait_ok_ms=8000); return True
 
     def carecv_once_exact(self, ask_len, overall_ms=8000):
@@ -191,7 +191,7 @@ class HardwareHAL:
             self._pin = machine.Pin(pin_no, machine.Pin.IN, pull_kw) if pull_kw else machine.Pin(pin_no, machine.Pin.IN)
         def read(self): return self._pin.value()
 
-    def set_sock_id(self, cid:int):
+    def set_sock_id(self, cid):
         try: self.current_sock_id = int(cid)
         except Exception: self.current_sock_id = 0
 
@@ -226,7 +226,7 @@ class HardwareHAL:
         if self.uart.any(): return self.uart.read(max_bytes) or b""
         return b""
 
-    def write_raw(self, data: bytes):
+    def write_raw(self, data):
         self.uart.write(data); return True
         
     def write_at(self, cmd):

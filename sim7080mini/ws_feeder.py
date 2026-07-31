@@ -34,19 +34,19 @@ else:
 _WS_PATH = "/cable"
 _WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-def _b64_str(raw: bytes) -> str:
+def _b64_str(raw):
     try:
         return _binascii.b2a_base64(raw).decode().strip()
     except Exception:
         import base64
         return base64.b64encode(raw).decode().strip()
 
-def _sha1(data: bytes) -> bytes:
+def _sha1(data):
     h = _hashlib.sha1()
     h.update(data)
     return h.digest()
 
-def _safe_decode(b: bytes, max_len=None):
+def _safe_decode(b, max_len=None):
     if max_len is not None:
         b = b[:max_len]
     try:
@@ -54,7 +54,7 @@ def _safe_decode(b: bytes, max_len=None):
     except Exception:
         return ""
 
-def _hex_preview(b: bytes, max_n=96):
+def _hex_preview(b, max_n=96):
     try:
         x = b[:max_n]
         return (_binascii.hexlify(x).decode() if hasattr(_binascii, "hexlify") else x.hex())
@@ -62,7 +62,7 @@ def _hex_preview(b: bytes, max_n=96):
         return ""
 
 class Command:
-    def __init__(self, cmd_id: str, cmd_type: str, payload=None):
+    def __init__(self, cmd_id, cmd_type, payload=None):
         self.id = cmd_id
         self.type = cmd_type
         self.payload = payload or {}
@@ -92,6 +92,8 @@ class WebSocketCommandFeeder:
         self._last_recv_bytes = 0
         self._last_rx_ms = 0
         self._connected_at_ms = 0
+        self._ac_ping_count = 0
+        self._ac_ping_count_since_stats = 0
         self.sock_id = int(sock_id)  # CID dedicado para WS (por defecto 1)
         self._identifier_str = None  # guardamos el identifier usado en subscribe
         self.token_in_query = bool(token_in_query)
@@ -147,7 +149,7 @@ class WebSocketCommandFeeder:
             pass
 
     # ---------- envio/recepcion ----------
-    def _send(self, data: bytes) -> bool:
+    def _send(self, data):
         prev = self._swap_to_ws_cid()
         try:
             safe_preview = self._redact_bytes(data)
@@ -159,7 +161,7 @@ class WebSocketCommandFeeder:
         finally:
             self._restore_cid(prev)
 
-    def _recv_some(self, ask=1460, ms=1200) -> bytes:
+    def _recv_some(self, ask=1460, ms=1200):
         prev = self._swap_to_ws_cid()
         try:
             b = self.m.carecv_once_exact(ask, overall_ms=ms) or b""
@@ -175,7 +177,7 @@ class WebSocketCommandFeeder:
             self._restore_cid(prev)
 
     # ---------- headers HTTP ----------
-    def _parse_http_headers(self, raw: bytes):
+    def _parse_http_headers(self, raw):
         txt = _safe_decode(raw)
         lines = txt.split("\r\n")
         status = lines[0] if lines else ""
@@ -209,7 +211,7 @@ class WebSocketCommandFeeder:
             self._log2("[ws<<hdr:partial]\n" + _safe_decode(acc))
         return acc, b""
 
-    def _validate_accept(self, key_b64: str, headers: dict):
+    def _validate_accept(self, key_b64, headers):
         acc = headers.get("sec-websocket-accept")
         if not acc:
             return True
@@ -222,7 +224,7 @@ class WebSocketCommandFeeder:
             return True
 
     # ---------- conexion / subscribe ----------
-    def connect(self) -> bool:
+    def connect(self):
         self._log1("[ws] conectando wss://{}:{}{}".format(self.host, self.port, _WS_PATH))
         prev = self._swap_to_ws_cid()
         try:
@@ -318,14 +320,14 @@ class WebSocketCommandFeeder:
         return True
 
     # ---------- frames ----------
-    def _mask_client_frame(self, payload: bytes) -> bytes:
+    def _mask_client_frame(self, payload):
         mask = _randbytes(4)
         masked = bytearray(len(payload))
         for i, b in enumerate(payload):
             masked[i] = b ^ mask[i & 3]
         return bytes(mask), bytes(masked)
 
-    def _build_frame_text(self, payload: bytes) -> bytes:
+    def _build_frame_text(self, payload):
         b0 = 0x80 | 0x1
         ln = len(payload)
         if ln <= 125:
@@ -340,7 +342,7 @@ class WebSocketCommandFeeder:
         self._log2("[ws>>frame:text] len=", len(frame), " payload_len=", ln, " payload_preview=", _safe_decode(safe_payload, 120))
         return frame
 
-    def _build_frame_ping(self, payload: bytes = b""):
+    def _build_frame_ping(self, payload=b""):
         b0 = 0x80 | 0x9
         ln = len(payload)
         if ln <= 125:
@@ -354,7 +356,7 @@ class WebSocketCommandFeeder:
         self._log2("[ws>>frame:ping] len=", len(frame), " payload_len=", ln)
         return frame
 
-    def _send_ws_text(self, s: str) -> bool:
+    def _send_ws_text(self, s):
         return self._send(self._build_frame_text(s.encode()))
 
     # ---------- ActionCable perform ----------
@@ -375,7 +377,7 @@ class WebSocketCommandFeeder:
             return False
         return True
 
-    def perform(self, action: str, **kwargs):
+    def perform(self, action, **kwargs):
         """
         Envia perform(action, **kwargs) usando el mismo identifier del subscribe.
         """
@@ -393,7 +395,7 @@ class WebSocketCommandFeeder:
         except Exception:
             return False
 
-    def send_ack(self, cmd_id: str, ok: bool, notes: str = ""):
+    def send_ack(self, cmd_id, ok, notes=""):
         """
         Atajo para perform('ack', id=..., ok=..., notes=...)
         """
@@ -484,7 +486,9 @@ class WebSocketCommandFeeder:
                 self.subscribed = False
                 continue
             if typ == "ping":
-                self._log1("[ws] actioncable ping")
+                self._ac_ping_count += 1
+                self._ac_ping_count_since_stats += 1
+                self._log2("[ws] actioncable ping")
                 self._last_rx_ms = self.hal.ticks_ms()
                 continue
             if typ and self.debug >= 1:
@@ -553,6 +557,8 @@ class WebSocketCommandFeeder:
         return out
 
     def stats(self):
+        ping_delta = self._ac_ping_count_since_stats
+        self._ac_ping_count_since_stats = 0
         return {
             "connected": bool(self.connected),
             "subscribed": bool(self.subscribed),
@@ -561,6 +567,8 @@ class WebSocketCommandFeeder:
             "dropped": self._dropped,
             "last_rx_ms": self._last_rx_ms,
             "last_ping_ms": self._last_ping_ms,
+            "actioncable_pings_total": self._ac_ping_count,
+            "actioncable_pings_delta": ping_delta,
         }
 
     def close(self):

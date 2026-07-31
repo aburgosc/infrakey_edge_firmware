@@ -130,7 +130,7 @@ class Actuator:
       state_snapshot() -> dict
     """
 
-    def __init__(self, hal, gpio_cfg: dict):
+    def __init__(self, hal, gpio_cfg):
         self.hal = hal
         self.cfg = gpio_cfg or {}
         self._mode = self.cfg.get("mode", None)
@@ -398,7 +398,7 @@ class Actuator:
         val = self._sensor_db.value()
         return 1 if val == self._sensor_open_is else 0
 
-    def tamper_triggered(self) -> bool:
+    def tamper_triggered(self):
         if self._tamper_replay_pending:
             self._tamper_replay_pending = False
             return True

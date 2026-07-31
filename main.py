@@ -7,6 +7,16 @@ try:
 except Exception:
     pass
 
+try:
+    import gc
+except Exception:
+    gc = None
+
+try:
+    import utime as _time
+except Exception:
+    import time as _time
+
 from sim7080mini.config import load_config
 from sim7080mini.infrakey import InfrakeyClient
 from sim7080mini.actuator import Actuator
@@ -37,6 +47,19 @@ def _safe_next_sleep(cfg, obj, fallback):
     base = _local_heartbeat_sec(cfg, value=cfg.get("heartbeat_interval_sec", fallback), fallback=fallback)
     min_sec = cfg.get("next_pull_min_sec", 30)
     max_sec = cfg.get("next_pull_max_sec", 86400)
+    runtime = cfg.get("runtime", {})
+    effective_max = runtime.get("heartbeat_effective_max_sec", 0)
+    try:
+        effective_max = int(effective_max)
+    except Exception:
+        effective_max = 0
+    local_cap = _local_heartbeat_sec(cfg, value=cfg.get("heartbeat_interval_sec", fallback), fallback=fallback)
+    if effective_max > 0 and effective_max > local_cap:
+        local_cap = effective_max
+    try:
+        max_sec = min(int(max_sec), int(local_cap))
+    except Exception:
+        max_sec = local_cap
     next_sleep = base
     if obj and isinstance(obj, dict) and "next_pull_sec" in obj:
         try:
@@ -79,7 +102,22 @@ def _make_ws(client, cfg, token, device_id, debug):
     )
 
 
-def main():
+def _collect_gc():
+    if gc:
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+
+def _sleep_ms(ms):
+    try:
+        _time.sleep_ms(int(ms))
+    except Exception:
+        _time.sleep(int(ms) / 1000.0)
+
+
+def _run_session():
     cfg = load_config("device_config.json")
     debug = cfg.get("debug", False)
     runtime = cfg.get("runtime", {})
@@ -114,7 +152,8 @@ def main():
         )
 
     if not client.bringup():
-        return
+        print("[supervisor] bringup fallido; se reintentara")
+        return False
 
     if runtime.get("healthcheck_on_startup", True):
         h_st, h_obj, h_dbg = client.health()
@@ -123,12 +162,13 @@ def main():
         if h_st not in (200, 201):
             print("[health] status=", h_st)
             if not runtime.get("healthcheck_timeout_fail_open", True):
-                return
+                print("[supervisor] healthcheck bloquea arranque; se reintentara")
+                return False
 
     device_id, token = client.claim_if_needed()
     if not (device_id and token):
         print("No se obtuvo token/device_id. Abortando.")
-        return
+        return False
     device_id, token = client.current_credentials(device_id, token)
 
     print("[claim] ok device_id=", device_id)
@@ -147,13 +187,18 @@ def main():
     ws_idle_timeout_ms = _bounded_sleep(runtime.get("ws_idle_timeout_ms", 90000), 90000)
     ws_confirm_timeout_ms = _bounded_sleep(runtime.get("ws_confirm_timeout_ms", 12000), 12000)
     status_log_interval_sec = _bounded_sleep(runtime.get("status_log_interval_sec", 30), 30)
+    ws_reconnect_fail_reset_threshold = _bounded_sleep(runtime.get("ws_reconnect_fail_reset_threshold", 3), 3)
+    ws_reconnect_fail_modem_reset_threshold = _bounded_sleep(runtime.get("ws_reconnect_fail_modem_reset_threshold", 6), 6)
     last_status_log_ms = 0
+    ws_reconnect_failures = 0
+    ws_down_since_ms = None
     if cfg.get("ws_enabled", False):
         ws = _make_ws(client, cfg, token, device_id, debug)
         last_ws_attempt_ms = client.hal.ticks_ms()
         if not ws.connect():
             print("[ws] no disponible; continuo con journal/cola RAM")
             ws = None
+            ws_down_since_ms = last_ws_attempt_ms
 
     pipeline = CommandPipeline(
         ws=ws,
@@ -226,6 +271,8 @@ def main():
                             pass
                         ws = None
                         pipeline.ws = None
+                        if ws_down_since_ms is None:
+                            ws_down_since_ms = now_ms
 
                     if (not ws) and client.hal.ticks_diff(now_ms, last_ws_attempt_ms) >= ws_reconnect_delay_ms:
                         last_ws_attempt_ms = now_ms
@@ -234,14 +281,29 @@ def main():
                             if ws.connect():
                                 print("[ws] reconectado")
                                 pipeline.ws = ws
+                                ws_reconnect_failures = 0
+                                ws_down_since_ms = None
                             else:
                                 print("[ws] reconexion fallida")
                                 ws = None
                                 pipeline.ws = None
+                                ws_reconnect_failures += 1
                         except Exception as exc:
                             print("[ws] error reconectando:", exc)
                             ws = None
                             pipeline.ws = None
+                            ws_reconnect_failures += 1
+
+                        if ws is None and ws_reconnect_failures >= ws_reconnect_fail_reset_threshold:
+                            restart_modem = ws_reconnect_failures >= ws_reconnect_fail_modem_reset_threshold
+                            print(
+                                "[ws] recovery escalado failures=",
+                                ws_reconnect_failures,
+                                "restart_modem=",
+                                restart_modem,
+                            )
+                            client.recover_connectivity(restart_modem=restart_modem)
+                            _collect_gc()
 
                 if runtime.get("journal_enabled", True):
                     journal.compact_if_needed(
@@ -261,10 +323,15 @@ def main():
                     if cfg.get("ws_enabled", False):
                         ws_state = "ready" if (ws and ws.is_healthy(idle_timeout_ms=ws_idle_timeout_ms, confirm_timeout_ms=ws_confirm_timeout_ms)) else "down"
                     queue_size = None
+                    ws_stats = {}
                     try:
                         queue_size = pipeline.stats().get("queue", {}).get("queued")
                     except Exception:
                         queue_size = None
+                    try:
+                        ws_stats = ws.stats() if ws else {}
+                    except Exception:
+                        ws_stats = {}
                     if getattr(client, "operational_debug", getattr(client, "debug", 0)):
                         print(
                             "[state]",
@@ -278,8 +345,14 @@ def main():
                             ws_state,
                             "last_hb=",
                             client.runtime_state.get("last_heartbeat_status"),
+                            "next_hb=",
+                            next_sleep,
                             "queue=",
                             queue_size,
+                            "ws_ping_delta=",
+                            ws_stats.get("actioncable_pings_delta", 0),
+                            "ws_retries=",
+                            ws_reconnect_failures,
                             "tamper_suppressed=",
                             bool(client.runtime_state.get("last_tamper_event_ms")),
                         )
@@ -290,6 +363,7 @@ def main():
                     print("[pipeline] stats:", pipeline.stats())
                 except Exception:
                     pass
+                _collect_gc()
                 client.hal.sleep_ms(loop_error_backoff_ms)
     finally:
         if ws:
@@ -301,6 +375,27 @@ def main():
             actuator.deinit()
         except Exception:
             pass
+        _collect_gc()
+    return True
+
+
+def main():
+    last_reason = None
+    while True:
+        try:
+            ok = _run_session()
+            if ok:
+                last_reason = "session_end"
+            else:
+                last_reason = "startup_retry"
+        except Exception as exc:
+            print("[supervisor] fatal:", exc)
+            last_reason = "fatal_exception"
+        _collect_gc()
+        cfg = load_config("device_config.json")
+        delay_ms = _bounded_sleep(cfg.get("runtime", {}).get("supervisor_restart_delay_ms", 5000), 5000)
+        print("[supervisor] restart in", delay_ms, "ms reason=", last_reason)
+        _sleep_ms(delay_ms)
 
 
 if __name__ == "__main__":

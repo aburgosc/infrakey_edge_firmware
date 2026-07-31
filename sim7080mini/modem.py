@@ -226,7 +226,7 @@ class SIM7080:
             self.hal.sleep_ms(gap_ms)
         return False
 
-    def _write_at_noresp(self, cmd: str):
+    def _write_at_noresp(self, cmd):
         if not str(cmd).startswith("AT"):
             cmd = "AT" + str(cmd)
         _log_debug(self.debug >= 1, ">>", cmd)
@@ -393,7 +393,7 @@ class SIM7080:
         )
         return bool(ok_ctx and ok_ssl)
 
-    def _explain_caopen_err(self, code: int) -> str:
+    def _explain_caopen_err(self, code):
         table = {
             1: "socket error",
             2: "sin memoria",
@@ -603,7 +603,7 @@ class SIM7080:
             base.update(extra)
         return "".join("{}: {}\r\n".format(k, v) for k, v in base.items())
 
-    def _decode_chunked(self, body_bytes: bytes) -> bytes:
+    def _decode_chunked(self, body_bytes):
         out = b""; i = 0; L = len(body_bytes)
         while True:
             j = body_bytes.find(b"\r\n", i)

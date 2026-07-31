@@ -3,6 +3,10 @@ try:
 except Exception:
     import json
 import os
+try:
+    import gc as _gc
+except Exception:
+    _gc = None
 from .hal import make_hal
 from .modem import SIM7080
 from .httpclient import HttpClient
@@ -17,7 +21,7 @@ def _safe_int(v, default):
 
 
 class InfrakeyClient:
-    def __init__(self, cfg: dict, debug=1):
+    def __init__(self, cfg, debug=1):
         self.cfg = cfg
         self.debug = debug
         runtime = cfg.get("runtime", {})
@@ -175,13 +179,21 @@ class InfrakeyClient:
         gps_mode = gps_cfg.get("mode", "static_config")
         allow_static = bool(gps_cfg.get("allow_static", True))
         include_source = bool(gps_cfg.get("include_source", True))
+        allow_stale_cache = bool(gps_cfg.get("allow_stale_cache", True))
+        cached_payload = None
+
+        try:
+            cached = self._gps_cache.get("payload")
+            if isinstance(cached, dict) and cached.get("latitude") is not None and cached.get("longitude") is not None:
+                cached_payload = cached
+        except Exception:
+            cached_payload = None
 
         if not force:
             try:
                 cache_ms = max(0, _safe_int(gps_cfg.get("cache_ms", 15000), 15000))
                 cached_at = self._gps_cache.get("at_ms")
                 if cached_at is not None and self.hal.ticks_diff(self.hal.ticks_ms(), cached_at) < cache_ms:
-                    cached_payload = self._gps_cache.get("payload")
                     if isinstance(cached_payload, dict):
                         return dict(cached_payload)
             except Exception:
@@ -213,6 +225,10 @@ class InfrakeyClient:
                     if include_source:
                         payload["gps_source"] = "modem_gnss"
 
+        if not payload and gps_mode in ("modem_gnss", "prefer_modem") and allow_stale_cache:
+            if isinstance(cached_payload, dict):
+                return dict(cached_payload)
+
         if not payload and allow_static:
             if self.latitude is not None:
                 payload["latitude"] = self.latitude
@@ -221,8 +237,9 @@ class InfrakeyClient:
             if ("latitude" in payload or "longitude" in payload) and include_source:
                 payload["gps_source"] = "static_config"
 
-        self._gps_cache["at_ms"] = self.hal.ticks_ms()
-        self._gps_cache["payload"] = dict(payload)
+        if payload.get("gps_source") == "modem_gnss":
+            self._gps_cache["at_ms"] = self.hal.ticks_ms()
+            self._gps_cache["payload"] = dict(payload)
         return payload
 
     def _valid_identity(self, imei, iccid):
@@ -247,7 +264,15 @@ class InfrakeyClient:
     def _request_with_retry(self, fn, op_name):
         last = (0, None, "")
         for attempt in range(1, self.http_retry_count + 1):
-            last = fn()
+            try:
+                last = fn()
+            except Exception as exc:
+                self._log("[http]", op_name, "exception attempt=", attempt, "err=", repr(exc))
+                try:
+                    self.modem.socket_close()
+                except Exception:
+                    pass
+                last = (0, None, "exception:{}".format(repr(exc)))
             status = last[0]
             if status in (200, 201, 202, 204):
                 return last
@@ -257,6 +282,49 @@ class InfrakeyClient:
                 continue
             break
         return last
+
+    def _gc_collect(self):
+        if _gc:
+            try:
+                _gc.collect()
+            except Exception:
+                pass
+
+    def recover_connectivity(self, restart_modem=False):
+        self._log("[recovery] start restart_modem=", bool(restart_modem))
+        self._gc_collect()
+        try:
+            self.modem.socket_close()
+        except Exception:
+            pass
+        try:
+            aux = SIM7080(self.hal, nb_band=self.cfg["nb_band"], tls_ctx=1, sock_id=1, debug=self.modem_debug)
+            aux.socket_close()
+        except Exception:
+            pass
+        try:
+            ready = self.modem._ensure_socket_context_ready(settle_ms=2500)
+        except Exception:
+            ready = False
+        if ready and not restart_modem:
+            self._log("[recovery] pdp ready")
+            self._gc_collect()
+            return True
+
+        self._log("[recovery] restarting modem stack")
+        try:
+            if not self.modem.start():
+                self._log("[recovery] modem start failed")
+                return False
+            self.modem.set_radio_nbiot()
+            ok = self.modem.attach_and_pdp(fallback_apn=self.cfg["apn_fallback"])
+            self._log("[recovery] attach result=", ok)
+            self._gc_collect()
+            return bool(ok)
+        except Exception as exc:
+            self._log("[recovery] failed:", exc)
+            self._gc_collect()
+            return False
 
     def _refresh_credentials(self, op_name):
         self._log("[auth]", op_name, "401 -> refreshing credentials")

@@ -15,6 +15,7 @@ from sim7080mini.actuator import Actuator
 from sim7080mini.config import load_config
 from sim7080mini.handlers import handle_command, handle_periodic_tasks
 from sim7080mini.hal import MockHAL, make_hal
+from sim7080mini.infrakey import InfrakeyClient
 from sim7080mini.outbox import JsonlEventOutbox
 from sim7080mini.ws_feeder import WebSocketCommandFeeder
 
@@ -261,6 +262,34 @@ def test_periodic_battery_low_and_offline_outbox(tmpdir):
         }
 
 
+def test_periodic_heartbeat_exception_is_recoverable(tmpdir):
+    with _pushd(tmpdir):
+        cfg = _make_cfg()
+        cfg["runtime"]["heartbeat_failure_retry_sec"] = 45
+        client = MockAppClient(cfg, debug=0)
+        actuator = Actuator(client.hal, cfg["gpio"])
+
+        def heartbeat_raises(*args, **kwargs):
+            raise RuntimeError("simulated heartbeat transport failure")
+
+        client.heartbeat = heartbeat_raises
+        last_hb_ms, next_sleep = handle_periodic_tasks(client, actuator, "DEV", "TOK", 0, 1)
+
+        assert int(next_sleep) == 45
+        assert client.runtime_state["last_heartbeat_status"] == 0
+        assert client.runtime_state["heartbeat_failures"] == 1
+        assert int(last_hb_ms) > 0
+        return {
+            "name": "periodic_heartbeat_exception_is_recoverable",
+            "status": "OK",
+            "details": {
+                "next_sleep": next_sleep,
+                "last_status": client.runtime_state["last_heartbeat_status"],
+                "failures": client.runtime_state["heartbeat_failures"],
+            },
+        }
+
+
 def test_temporizer_clamp(tmpdir):
     with _pushd(tmpdir):
         os.environ["SIM7080_MOCK_BATTERY_V"] = "3.60"
@@ -273,6 +302,51 @@ def test_temporizer_clamp(tmpdir):
         _, next_sleep = handle_periodic_tasks(client, actuator, "DEV", "TOK", 0, 1)
         assert 30 <= int(next_sleep) <= 300
         return {"name": "temporizer_clamp", "status": "OK", "details": {"next_sleep": next_sleep}}
+
+
+def test_update_config_heartbeat_is_schedule_cap(tmpdir):
+    with _pushd(tmpdir):
+        cfg = _make_cfg()
+        cfg["runtime"]["heartbeat_effective_max_sec"] = 300
+        cfg["next_pull_min_sec"] = 30
+        cfg["next_pull_max_sec"] = 86400
+        client = MockAppClient(cfg, debug=0)
+        actuator = Actuator(client.hal, cfg["gpio"])
+        ws = WsAckStub()
+
+        result = handle_command(
+            SimpleCmd("cfg-hb-600", "update_config", {"heartbeat_interval": 600}),
+            client,
+            actuator,
+            cfg,
+            "DEV",
+            "TOK",
+            ws=ws,
+        )
+
+        def heartbeat_86400(device_id, auth_token, battery_v=None, battery_pct=None, latitude=None, longitude=None, extra=None):
+            client.heartbeats.append({
+                "device_id": device_id,
+                "auth_token": auth_token,
+                "battery_v": battery_v,
+                "battery_pct": battery_pct,
+                "latitude": latitude,
+                "longitude": longitude,
+                "extra": extra or {},
+            })
+            return 201, {"ok": True, "next_pull_sec": 86400}, ""
+
+        client.heartbeat = heartbeat_86400
+        _, next_sleep = handle_periodic_tasks(client, actuator, "DEV", "TOK", 0, 1)
+
+        assert result["local_ok"] is True
+        assert int(cfg["heartbeat_interval_sec"]) == 600
+        assert int(next_sleep) == 600
+        return {
+            "name": "update_config_heartbeat_is_schedule_cap",
+            "status": "OK",
+            "details": {"heartbeat_interval_sec": cfg["heartbeat_interval_sec"], "next_sleep": next_sleep},
+        }
 
 
 def test_snapshot_disabled(tmpdir):
@@ -337,6 +411,36 @@ def test_telemetry_fallback_and_static_gps(tmpdir):
         assert "telemetry_missing" in snap
         assert "battery_v" not in snap
         return {"name": "telemetry_fallback_and_static_gps", "status": "OK", "details": snap}
+
+
+def test_gnss_uses_stale_real_cache_without_static(tmpdir):
+    with _pushd(tmpdir):
+        cfg = _make_cfg()
+        cfg["latitude"] = 1.111111
+        cfg["longitude"] = 2.222222
+        cfg["gps"]["mode"] = "modem_gnss"
+        cfg["gps"]["allow_static"] = False
+        cfg["gps"]["allow_stale_cache"] = True
+        cfg["gps"]["cache_ms"] = 1
+
+        client = InfrakeyClient(cfg, debug=0)
+        client._gps_cache["at_ms"] = client.hal.ticks_ms() - 999999
+        client._gps_cache["payload"] = {
+            "latitude": -41.46294,
+            "longitude": -72.96671,
+            "gps_source": "modem_gnss",
+        }
+        client.modem.read_gnss_location = lambda ensure_power=True, attempts=1, delay_ms=1000: None
+        client.modem.ensure_gnss_power = lambda enabled=True: True
+
+        loc = client.resolve_location(force=False)
+
+        assert loc["latitude"] == -41.46294
+        assert loc["longitude"] == -72.96671
+        assert loc["latitude"] != cfg["latitude"]
+        assert loc["longitude"] != cfg["longitude"]
+        assert loc.get("gps_source") == "modem_gnss"
+        return {"name": "gnss_uses_stale_real_cache_without_static", "status": "OK", "details": loc}
 
 
 def test_update_config_validation_guards(tmpdir):
@@ -880,11 +984,14 @@ def run_all():
             test_config_snapshot_and_ping,
             test_authorization_and_command_flow,
             test_periodic_battery_low_and_offline_outbox,
+            test_periodic_heartbeat_exception_is_recoverable,
             test_temporizer_clamp,
+            test_update_config_heartbeat_is_schedule_cap,
             test_snapshot_disabled,
             test_snapshot_alias_instantanea,
             test_power_profile_update,
             test_telemetry_fallback_and_static_gps,
+            test_gnss_uses_stale_real_cache_without_static,
             test_update_config_validation_guards,
             test_heartbeat_failure_recovery_state,
             test_next_pull_invalid_clamp,

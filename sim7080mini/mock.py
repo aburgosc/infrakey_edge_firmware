@@ -117,7 +117,7 @@ class SIM7080Modem:
         ]
         return ("\r\n".join(head) + body).encode("utf-8")
 
-    def _http_reply_for_request(self, data: bytes):
+    def _http_reply_for_request(self, data):
         txt = data.decode("utf-8","ignore")
         first = (txt.splitlines() or [""])[0]
         parts = first.split()

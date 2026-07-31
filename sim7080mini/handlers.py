@@ -192,7 +192,7 @@ def _validate_gpio_patch(patch):
     return True, out
 
 
-def _apply_update_config(cfg: dict, payload: dict):
+def _apply_update_config(cfg, payload):
     if not isinstance(payload, dict) or not payload:
         return False, "empty_payload"
 
@@ -299,11 +299,17 @@ def _apply_update_config(cfg: dict, payload: dict):
 
 def _next_sleep_from_obj(cfg, obj, current):
     next_sleep = _local_heartbeat_sec(cfg, value=current)
+    runtime = cfg.get("runtime", {})
+    effective_max = _safe_int(runtime.get("heartbeat_effective_max_sec", 0), 0)
+    local_cap = _local_heartbeat_sec(cfg)
+    if effective_max > 0 and effective_max > local_cap:
+        local_cap = effective_max
     if obj and isinstance(obj, dict) and "next_pull_sec" in obj:
         cand = _safe_int(obj.get("next_pull_sec"), None)
         if cand is not None:
             min_sec = _safe_int(cfg.get("next_pull_min_sec", 30), 30)
             max_sec = _safe_int(cfg.get("next_pull_max_sec", 86400), 86400)
+            max_sec = min(max_sec, local_cap)
             next_sleep = _clamp(cand, min_sec, max_sec)
     return next_sleep
 
@@ -681,6 +687,7 @@ def handle_command(cmd, client, actuator, cfg, device_id, token, ws=None):
 
 
 def handle_periodic_tasks(client, actuator, device_id, token, last_hb_ms, next_sleep):
+    runtime = client.cfg.get("runtime", {})
     ts = now_iso_utc_or_none(client.hal)
     while True:
         transition = actuator.poll_transition()
@@ -736,22 +743,36 @@ def handle_periodic_tasks(client, actuator, device_id, token, last_hb_ms, next_s
             heartbeat_extra["gps_source"] = base_telemetry["gps_source"]
         if "telemetry_missing" in base_telemetry:
             heartbeat_extra["telemetry_missing"] = base_telemetry["telemetry_missing"]
-        st, obj, dbg = client.heartbeat(
-            device_id,
-            token,
-            battery_v=battery_v,
-            battery_pct=battery_pct,
-            latitude=base_telemetry.get("latitude"),
-            longitude=base_telemetry.get("longitude"),
-            extra=heartbeat_extra,
-        )
+        try:
+            st, obj, dbg = client.heartbeat(
+                device_id,
+                token,
+                battery_v=battery_v,
+                battery_pct=battery_pct,
+                latitude=base_telemetry.get("latitude"),
+                longitude=base_telemetry.get("longitude"),
+                extra=heartbeat_extra,
+            )
+        except Exception as exc:
+            st, obj, dbg = 0, None, "exception:{}".format(repr(exc))
+            _log_debug(client, "[heartbeat] exception=", repr(exc))
+            try:
+                if hasattr(client, "modem"):
+                    client.modem.socket_close()
+            except Exception:
+                pass
         if isinstance(obj, dict):
             try:
                 client.runtime_state["last_heartbeat_next_pull_sec"] = obj.get("next_pull_sec")
             except Exception:
                 pass
         client.note_heartbeat_status(st, flush_device_id=device_id, flush_token=token)
-        next_sleep = _next_sleep_from_obj(client.cfg, obj, next_sleep)
+        if st in (200, 201):
+            next_sleep = _next_sleep_from_obj(client.cfg, obj, next_sleep)
+        else:
+            retry_sec = _safe_int(runtime.get("heartbeat_failure_retry_sec", 60), 60)
+            min_sec = _safe_int(client.cfg.get("next_pull_min_sec", 30), 30)
+            next_sleep = _clamp(retry_sec, min_sec, _local_heartbeat_sec(client.cfg))
         last_hb_ms = client.hal.ticks_ms()
         _log_debug(
             client,

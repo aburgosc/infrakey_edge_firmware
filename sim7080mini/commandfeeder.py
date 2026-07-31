@@ -27,7 +27,7 @@ def _safe_size(path):
 
 
 class Command:
-    def __init__(self, cmd_id: str, cmd_type: str, payload=None, source="unknown", meta=None):
+    def __init__(self, cmd_id, cmd_type, payload=None, source="unknown", meta=None):
         self.id = cmd_id
         self.type = cmd_type
         self.payload = payload or {}
