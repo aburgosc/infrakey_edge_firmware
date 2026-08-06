@@ -73,7 +73,12 @@ class InfrakeyClient:
         self.auth_token = None
         outbox_path = cfg.get("files", {}).get("outbox", "outbox.jsonl")
         outbox_state = cfg.get("files", {}).get("outbox_state", outbox_path + ".state.json")
-        self.outbox = JsonlEventOutbox(outbox_path=outbox_path, state_path=outbox_state, debug=debug)
+        self.outbox = JsonlEventOutbox(
+            outbox_path=outbox_path,
+            state_path=outbox_state,
+            debug=debug,
+            max_outbox_bytes=_safe_int(runtime.get("outbox_max_bytes", 65536), 65536),
+        )
         self.runtime_state = {
             "heartbeat_failures": 0,
             "device_offline_queued": False,
@@ -84,6 +89,7 @@ class InfrakeyClient:
         }
         self._gps_cache = {
             "at_ms": None,
+            "attempt_ms": None,
             "payload": None,
         }
 
@@ -210,11 +216,21 @@ class InfrakeyClient:
                         return dict(cached_payload)
             except Exception:
                 pass
+            try:
+                retry_ms = max(0, _safe_int(gps_cfg.get("retry_ms", 300000), 300000))
+                attempted_at = self._gps_cache.get("attempt_ms")
+                if attempted_at is not None and self.hal.ticks_diff(self.hal.ticks_ms(), attempted_at) < retry_ms:
+                    if isinstance(cached_payload, dict) and allow_stale_cache:
+                        return dict(cached_payload)
+                    return {}
+            except Exception:
+                pass
 
         payload = {}
         if gps_mode in ("modem_gnss", "prefer_modem"):
             power_down_after_read = bool(gps_cfg.get("power_down_after_read", True))
             try:
+                self._gps_cache["attempt_ms"] = self.hal.ticks_ms()
                 info = self.modem.read_gnss_location(
                     ensure_power=True,
                     attempts=max(1, _safe_int(gps_cfg.get("poll_attempts", 2), 2)),
@@ -337,6 +353,12 @@ class InfrakeyClient:
 
         self._log("[recovery] restarting modem stack")
         try:
+            if restart_modem:
+                try:
+                    if not self.modem.reset_module():
+                        self._log("[recovery] modem reset failed; intentando start")
+                except Exception as reset_exc:
+                    self._log("[recovery] modem reset exception:", reset_exc)
             if not self.modem.start():
                 self._log("[recovery] modem start failed")
                 return False

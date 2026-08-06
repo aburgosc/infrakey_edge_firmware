@@ -73,7 +73,7 @@ class WebSocketCommandFeeder:
     TLS con el modem, upgrade WebSocket, Suscripcion a DeviceCommandsChannel
     y entrega comandos via pull(). ACK opcional por WS.
     """
-    def __init__(self, modem, hal, host, port=443, token=None, identifier_extra=None, debug=1, sock_id=1, max_queue=32, token_in_query=False, connect_host=None):
+    def __init__(self, modem, hal, host, port=443, token=None, identifier_extra=None, debug=1, sock_id=1, max_queue=32, token_in_query=False, connect_host=None, max_buffer_bytes=4096):
         self.m = modem
         self.hal = hal
         self.host = host
@@ -85,6 +85,7 @@ class WebSocketCommandFeeder:
         self.connected = False
         self.subscribed = False
         self._buf = b""
+        self.max_buffer_bytes = max(512, int(max_buffer_bytes or 4096))
         self._queue = []
         self.max_queue = max(1, int(max_queue or 32))
         self._dropped = 0
@@ -104,6 +105,25 @@ class WebSocketCommandFeeder:
             self._log1("[ws] queue overflow drop id=", getattr(cmd, "id", "?"))
             return False
         self._queue.append(cmd)
+        return True
+
+    def _buffer_append(self, data):
+        if not data:
+            return True
+        if len(self._buf) + len(data) > self.max_buffer_bytes:
+            self._log1("[ws] buffer overflow; cerrando canal len=", len(self._buf) + len(data), "max=", self.max_buffer_bytes)
+            self._buf = b""
+            self.connected = False
+            self.subscribed = False
+            prev = self._swap_to_ws_cid()
+            try:
+                self.m.socket_close()
+            except Exception:
+                pass
+            finally:
+                self._restore_cid(prev)
+            return False
+        self._buf += data
         return True
 
     # ---------- logging helpers ----------
@@ -292,8 +312,8 @@ class WebSocketCommandFeeder:
 
         if leftover:
             self._log2("[ws] leftover posheader bytes=", len(leftover))
-            self._buf += leftover
-            self._parse_frames_into_queue()
+            if self._buffer_append(leftover):
+                self._parse_frames_into_queue()
 
         ident_dict = {"channel": "DeviceCommandsChannel"}
         ident_dict.update(self.identifier_extra)
@@ -535,7 +555,8 @@ class WebSocketCommandFeeder:
             if not chunk:
                 break
             total_read += len(chunk)
-            self._buf += chunk
+            if not self._buffer_append(chunk):
+                break
             self._parse_frames_into_queue()
         if total_read:
             self._log2("[ws] tick read_bytes=", total_read, " buf_len=", len(self._buf))

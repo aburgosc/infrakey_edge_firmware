@@ -1,203 +1,95 @@
 # PLAN VALIDATION
 
-Pauta ordenada para validar el firmware final con hardware real, backend real y WebSocket real.
+Pauta simple para validar el firmware con hardware real y backend real.
 
-Este documento define:
+## Objetivo
 
-- prerequisitos
-- secuencia de ejecución
-- evidencia a capturar
-- criterios de aprobación
+Confirmar que el dispositivo:
 
-## 1. Objetivo
+- arranca correctamente
+- se conecta a la red
+- se registra en Infrakey
+- envia heartbeat inicial y periodico
+- mantiene WebSocket operativo
+- recibe comandos remotos
+- mueve el actuador
+- detecta apertura y cierre fisico
+- reporta eventos correctos
+- se recupera ante fallas transitorias
 
-Confirmar que el firmware:
+## Prerrequisitos
 
-- arranca correctamente en hardware real
-- se integra correctamente con la API documentada
-- recibe y ejecuta comandos del contrato
-- emite eventos del contrato con payload coherente
-- mantiene estabilidad operativa ante fallas transitorias
+Antes de iniciar:
 
-## 2. Alcance de validación
+- SIM activa y con cobertura.
+- Antenas LTE y GNSS conectadas.
+- Alimentacion estable.
+- Actuador conectado.
+- Sensor magnetico conectado.
+- Configuracion de terreno cargada usando `device_config.terreno.example.json` como referencia.
+- Acceso a consola serial.
+- Acceso a la plataforma Infrakey para observar estado, eventos y comandos.
 
-### REST
+## 1. Arranque
 
-- `health`
-- `claim`
-- `heartbeat`
-- `events`
-- `snapshot`
-- `ack`
+Pasos:
 
-### WebSocket
+1. Energizar el dispositivo.
+2. Abrir la consola serial.
+3. Esperar el arranque completo.
 
-- handshake
-- `confirm_subscription`
-- recepción de comandos
-- `ACK` por WS si aplica
-- reconexión
+Esperado:
 
-### Hardware
+- aparece `[boot]`
+- el modem responde
+- se obtiene o reutiliza `device_id`
+- se envia heartbeat inicial
+- no hay crash
 
-- actuador
-- sensor de estado
-- tamper
-- alimentación
+Criterio de aprobacion:
 
-### Persistencia y recovery
+- el dispositivo queda en ejecucion continua y muestra resumen `[state]`.
 
-- `token.json`
-- `commands_queue.jsonl`
-- `commands_state.json`
-- `outbox.jsonl`
-- `outbox_state.json`
+## 2. Red Y API
 
-## 3. Prerrequisitos
+Validar:
 
-### Hardware
+- el dispositivo logra conectarse a NB-IoT
+- el APN queda activo
+- el heartbeat inicial responde correctamente
+- los heartbeats periodicos siguen ejecutandose
+- si hay una falla HTTP, el firmware no se detiene y reintenta
 
-- Raspberry Pi Pico con firmware cargado
-- módulo SIM7080 operativo
-- SIM activa
-- antena conectada
-- alimentación estable
-- actuador conectado
-- sensor de estado conectado
-- tamper conectado si aplica
+Criterio de aprobacion:
 
-### Configuración
+- la plataforma muestra ultimo ping actualizado.
+- la consola no vuelve al prompt por una falla silenciosa.
 
-- [device_config.json](C:/Proyectos/Raspberry%20Pi/Proyecto%20Braulio/Testing-APIS/proyectofinal/device_config.json:1) revisado
-- acceso al backend real
-- acceso al canal que envía comandos
-- consola serial o equivalente
+## 3. WebSocket
 
-### Documentos a mano
+Validar:
 
-- [docs/Dcoumentacion_API_V1.md](C:/Proyectos/Raspberry%20Pi/Proyecto%20Braulio/Testing-APIS/proyectofinal/docs/Dcoumentacion_API_V1.md:1)
-- [docs/Matriz_Evidencia_Integracion_Real.md](C:/Proyectos/Raspberry%20Pi/Proyecto%20Braulio/Testing-APIS/proyectofinal/docs/Matriz_Evidencia_Integracion_Real.md:1)
-- [docs/Guia_Observacion_Consola.md](C:/Proyectos/Raspberry%20Pi/Proyecto%20Braulio/Testing-APIS/proyectofinal/docs/Guia_Observacion_Consola.md:1)
-- [docs/Checklist_Cierre_Firmware.md](C:/Proyectos/Raspberry%20Pi/Proyecto%20Braulio/Testing-APIS/proyectofinal/docs/Checklist_Cierre_Firmware.md:1)
+1. El dispositivo abre el canal WebSocket.
+2. La suscripcion queda confirmada.
+3. Se observan pings de ActionCable.
+4. Se recibe al menos un comando remoto.
+5. Si el canal cae, el firmware intenta reconectar.
 
-## 4. Orden recomendado
+Esperado en consola:
 
-1. Pre-flight
-2. Arranque
-3. REST base
-4. WebSocket
-5. Comandos del contrato
-6. Eventos del contrato
-7. Temporizadores y fallback
-8. Recovery y persistencia
-9. Telemetría
-10. Consolidación de evidencia
+```text
+[ws] conectando ...
+[ws] suscripcion confirmada
+[ws] actioncable ping
+```
 
-## 5. Fase 0: Pre-flight
+Criterio de aprobacion:
 
-Verificar antes de energizar:
+- el dispositivo puede recibir comandos sin reinicio manual.
 
-- cableado
-- fuente
-- SIM
-- antena
-- configuración cargada
-- visibilidad de consola
-- acceso al backend
+## 4. Comandos
 
-### Aprobación
-
-- entorno listo
-- sin bloqueos externos evidentes
-
-## 6. Fase 1: Arranque
-
-### Pasos
-
-1. energizar el equipo
-2. abrir consola
-3. observar bringup
-4. confirmar que el loop quede corriendo
-
-### Esperado en consola
-
-- `[boot]`
-- `[health]`
-- `[claim]`
-- `[heartbeat] startup`
-
-### Evidencia
-
-- log de arranque
-- `device_id`
-- hora de inicio
-
-### Aprobación
-
-- arranque completo
-- sin crash
-
-## 7. Fase 2: REST base
-
-### Casos
-
-#### 2.1 `health`
-
-- confirmar respuesta correcta
-
-#### 2.2 `claim`
-
-- confirmar obtención o recuperación de token
-
-#### 2.3 `heartbeat`
-
-- confirmar `heartbeat` aceptado
-- confirmar aplicación de `next_pull_sec` si aparece
-
-#### 2.4 `ack`
-
-- confirmar cierre de comando en backend
-
-### Evidencia
-
-- status HTTP
-- payload observado
-- timestamps de backend
-
-### Aprobación
-
-- endpoints básicos operativos
-
-## 8. Fase 3: WebSocket
-
-### Casos
-
-1. apertura del socket
-2. `confirm_subscription`
-3. recepción de comando
-4. trazabilidad de `ACK`
-5. reconexión tras corte controlado
-
-### Esperado en consola
-
-- `socket abierto; esperando confirm_subscription`
-- `suscripcion confirmada`
-- trazas del comando recibido
-
-### Evidencia
-
-- log de suscripción
-- comando recibido
-- `ACK` asociado
-
-### Aprobación
-
-- no se procesan comandos antes de la suscripción
-- el canal se recupera si se induce caída
-
-## 9. Fase 4: Comandos del contrato
-
-Ejecutar estos comandos:
+Probar desde la plataforma:
 
 1. `ping`
 2. `open_actuator`
@@ -205,221 +97,162 @@ Ejecutar estos comandos:
 4. `snapshot`
 5. `update_config`
 
-### Opcional de compatibilidad interna
+Para cada comando validar:
 
-- `pulse_actuator`
+- llega por consola
+- se ejecuta o rechaza con razon clara
+- se envia ACK
+- la plataforma refleja el resultado esperado
 
-Solo correrlo si el backend real lo soporta o si se quiere validar extensión interna del firmware.
+Criterio de aprobacion:
 
-### Para cada comando registrar
+- todos los comandos documentados responden sin bloquear el loop.
 
-- timestamp de envío
-- timestamp de recepción
-- resultado local
-- `ACK` HTTP
-- `ACK` WS si aplica
-- efecto visible
+## 5. Apertura Autorizada
 
-### Validación de apertura autorizada y forzada
+Pasos:
 
-1. Ejecutar `exec(open("probe_sensor.py").read())` en la Pico y aplicar al
-   JSON la polaridad recomendada para `sensor_open_is` y `sensor_pull`.
-2. Con la puerta cerrada, enviar `open_actuator` y abrirla dentro de
-   `sensor_authorized_open_ms`.
-3. Confirmar el movimiento, `device_opened` y ausencia de `tamper_alert` y
-   `unauthorized_access`.
-4. Cerrar físicamente la puerta sin enviar una nueva orden.
-5. Abrirla físicamente y confirmar ambos eventos de seguridad con el mismo
-   `security_event_id`.
-6. Repetir una apertura después de dejar vencer
-   `sensor_authorized_open_ms`; debe clasificarse como no autorizada.
-7. Reiniciar con el contacto abierto y confirmar una sola alerta con motivo
-   `door_open_on_boot`.
-8. Reiniciar abierto, cerrar dentro de `sensor_boot_grace_ms` y confirmar que
-   no se genera un falso positivo.
-9. Repetir sin cobertura y confirmar que los eventos quedan en `outbox.jsonl`
-   y se entregan al recuperar la red.
+1. Dejar la compuerta cerrada.
+2. Enviar `open_actuator`.
+3. Confirmar que el actuador se mueve.
+4. Abrir fisicamente la compuerta.
 
-### Aprobación
+Esperado:
 
-- ejecución o rechazo coherente
-- sin pérdida silenciosa
+- se emite `authorization_request`
+- se emite `authorization_granted`
+- al abrir el sensor se emite `device_opened`
+- no se emite `tamper_alert`
+- no se emite `unauthorized_access`
 
-## 10. Fase 5: Eventos del contrato
+Criterio de aprobacion:
 
-Validar:
+- una apertura remota autorizada nunca genera falsa alarma.
 
-1. `tamper_alert`
-2. `unauthorized_access`
-3. `battery_low`
-4. `authorization_request`
-5. `authorization_granted`
-6. `device_offline`
-7. `device_opened`
-8. `device_closed`
+## 6. Cierre Remoto O Manual
 
-### Método
+Pasos:
 
-- inducir condición física o funcional
-- observar consola
-- observar backend
-- correlacionar evento con la acción real
+1. Con la compuerta abierta, enviar `close_actuator`.
+2. Confirmar que el actuador se mueve.
+3. Cerrar fisicamente la compuerta o confirmar que el mecanismo la cerro.
 
-### Evidencia
+Esperado:
 
-- `event_id`
-- severidad observada
-- status backend
-- timestamp backend
+- el estado pasa a `locking_pending`
+- no se emite `device_closed` solo por ejecutar el comando
+- cuando el sensor confirma cerrado, se emite `device_closed`
+- el estado vuelve a `locked`
 
-### Aprobación
+Criterio de aprobacion:
 
-- el evento correcto aparece
-- la severidad es coherente con la API
+- el cierre se confirma solo por sensor fisico.
 
-## 11. Fase 6: Temporizadores y fallback
+## 7. Apertura No Autorizada
 
-### Casos
+Pasos:
 
-#### 6.1 Heartbeat local
+1. Dejar el dispositivo en estado cerrado y bloqueado.
+2. Abrir fisicamente el sensor sin enviar comando remoto.
 
-- validar periodicidad observada
+Esperado:
 
-#### 6.2 `next_pull_sec`
+- se emite `tamper_alert`
+- se emite `unauthorized_access`
+- no se duplica la alerta por rebote
 
-- validar aplicación y clamp
+Criterio de aprobacion:
 
-#### 6.3 Falla temporal de red
+- una apertura forzada queda registrada como evento de seguridad.
 
-- inducir falla
-- confirmar continuidad del loop
+## 8. Arranque Con Sensor Abierto
 
-#### 6.4 Recuperación
+Pasos:
 
-- restaurar conectividad
-- validar recuperación de heartbeat
-- validar flush de outbox
+1. Dejar el sensor en estado abierto.
+2. Reiniciar el dispositivo.
 
-### Aprobación
+Esperado:
 
-- el proceso no cae
-- el recovery es consistente
+- se detecta condicion abierta al iniciar
+- se reporta alerta diferenciada de arranque anomalo
+- no se generan eventos duplicados continuamente
 
-## 12. Fase 7: Recovery y persistencia
+Criterio de aprobacion:
 
-### Casos
+- el sistema distingue arranque abierto de una apertura forzada posterior.
 
-#### 7.1 Reinicio controlado
-
-- reiniciar
-- confirmar recuperación del runtime
-
-#### 7.2 Comando persistido
-
-- inducir reinicio cercano a un comando persistido
-- validar tratamiento de `inflight`
-
-#### 7.3 Evento diferido
-
-- forzar evento con backend inaccesible
-- restaurar conectividad
-- validar flush posterior
-
-### Evidencia
-
-- estado de archivos persistentes
-- trazas de recovery
-- resultado final
-
-### Aprobación
-
-- sin corrupción visible
-- recovery coherente
-
-## 13. Fase 8: Telemetría
+## 9. GPS
 
 Validar:
 
-- `battery_v`
-- `battery_pct`
-- `snapshot`
-- `heartbeat`
-- coordenadas
-- `gps_source`
-- `telemetry_missing` si aplica
+- el dispositivo intenta leer GNSS real
+- heartbeat y snapshot incluyen `latitude` y `longitude` cuando hay lectura o cache real
+- si no hay GPS real, no se inventan coordenadas estaticas cuando la configuracion lo prohibe
 
-### Aprobación
+Criterio de aprobacion:
 
-- payload coherente con el entorno
-- si falta dato real, el firmware no inventa un valor engañoso
+- la plataforma muestra ubicacion cuando hay coordenadas reales disponibles.
 
-## 14. Fase 9: Consumo
+## 10. Heartbeat Y Online
 
-Si existe instrumentación:
+Validar:
 
-- registrar consumo en reposo
-- registrar consumo con WS activo
-- registrar consumo durante heartbeat
+- se envia heartbeat al arranque
+- se envia heartbeat periodico
+- `update_config` puede cambiar el intervalo permitido
+- el dispositivo no queda offline si WebSocket cae pero el heartbeat sigue funcionando
+- si el heartbeat falla, se reintenta con el intervalo de recuperacion
 
-Si no existe instrumentación:
+Criterio de aprobacion:
 
-- dejarlo marcado como pendiente de medición formal
+- el ultimo ping en plataforma se mantiene actualizado.
 
-## 15. Evidencia mínima obligatoria
+## 11. Recuperacion
 
-- log de arranque
-- evidencia de `health`
-- evidencia de `claim`
-- evidencia de `heartbeat`
-- evidencia de `confirm_subscription`
-- evidencia de `ping`
-- evidencia de `open_actuator`
-- evidencia de `close_actuator`
-- evidencia de `snapshot`
-- evidencia de al menos un evento crítico
-- evidencia de recovery ante falla temporal
-- matriz completada
+Probar fallas controladas:
 
-## 16. Criterios de aprobación final
+- perdida temporal de senal
+- caida temporal del WebSocket
+- respuesta HTTP fallida
+- reinicio controlado del dispositivo
 
-La validación se considera aprobada si:
+Esperado:
 
-- REST funciona con backend real
-- WS funciona con backend real
-- los comandos del contrato ejecutan correctamente
-- los eventos del contrato quedan observables
-- el loop se mantiene estable
-- recovery y persistencia se comportan correctamente
+- el firmware imprime la causa
+- no queda bloqueado sin traza
+- reintenta conexion
+- vuelve a operar cuando la red se recupera
 
-## 17. Criterios de pausa o rechazo
+Criterio de aprobacion:
 
-Detener si aparece alguno de estos casos:
+- no requiere intervencion manual para volver a operar tras fallas transitorias.
 
-- reinicio repetitivo
-- pérdida persistente de conectividad sin recovery
-- comandos sin trazabilidad
-- eventos incorrectos o invertidos
-- actuación física insegura
-- corrupción evidente de archivos de estado
+## 12. Criterios Finales De Aprobacion
 
-## 18. Salida final
+El sistema se considera validado si:
 
-Al terminar deben quedar actualizados:
+- arranca de forma estable
+- reporta heartbeat inicial
+- mantiene heartbeat periodico
+- recibe comandos por WebSocket
+- ejecuta apertura y cierre
+- confirma apertura/cierre por sensor
+- reporta tamper real
+- no genera tamper falso en apertura autorizada
+- reporta ubicacion real cuando GNSS esta disponible
+- recupera WebSocket y API ante fallas transitorias
+- mantiene trazabilidad clara por consola
 
-- [docs/Matriz_Evidencia_Integracion_Real.md](C:/Proyectos/Raspberry%20Pi/Proyecto%20Braulio/Testing-APIS/proyectofinal/docs/Matriz_Evidencia_Integracion_Real.md:1)
-- [docs/Checklist_Cierre_Firmware.md](C:/Proyectos/Raspberry%20Pi/Proyecto%20Braulio/Testing-APIS/proyectofinal/docs/Checklist_Cierre_Firmware.md:1)
-- [docs/Informe_Conformidad_Firmware.md](C:/Proyectos/Raspberry%20Pi/Proyecto%20Braulio/Testing-APIS/proyectofinal/docs/Informe_Conformidad_Firmware.md:1)
+## 13. Criterios De Rechazo
 
-## 19. Resultado posible
+Detener la validacion si ocurre:
 
-### Caso A
-
-Validado sin observaciones mayores.
-
-### Caso B
-
-Validado con observaciones menores y feedback para ajuste acotado.
-
-### Caso C
-
-Validación rechazada con hallazgo bloqueante reproducible.
+- actuador se mueve de forma insegura
+- sensor reporta estados invertidos
+- heartbeat deja de ejecutarse
+- WebSocket cae y nunca intenta reconectar
+- una apertura autorizada genera `unauthorized_access`
+- una apertura forzada no genera alerta
+- el firmware vuelve al prompt sin explicar la falla
+- el dispositivo requiere reinicio manual para recuperar una falla transitoria

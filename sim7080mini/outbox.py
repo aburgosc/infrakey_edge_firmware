@@ -20,10 +20,11 @@ def _safe_size(path):
 
 
 class JsonlEventOutbox:
-    def __init__(self, outbox_path, state_path, debug=1):
+    def __init__(self, outbox_path, state_path, debug=1, max_outbox_bytes=65536):
         self.outbox_path = outbox_path
         self.state_path = state_path
         self.debug = debug
+        self.max_outbox_bytes = max(4096, int(max_outbox_bytes or 65536))
         self._state = self._load_state()
         self._ensure_file(self.outbox_path)
 
@@ -71,6 +72,10 @@ class JsonlEventOutbox:
             return False
 
     def enqueue(self, record):
+        size = _safe_size(self.outbox_path)
+        if size >= self.max_outbox_bytes:
+            self._log("[outbox] max size reached; event not queued size=", size, "max=", self.max_outbox_bytes)
+            return False
         try:
             with open(self.outbox_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
@@ -125,9 +130,12 @@ class JsonlEventOutbox:
         try:
             with open(self.outbox_path, "rb") as src:
                 src.seek(offset)
-                remaining = src.read()
-            with open(tmp, "wb") as dst:
-                dst.write(remaining or b"")
+                with open(tmp, "wb") as dst:
+                    while True:
+                        chunk = src.read(512)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
             _safe_remove(self.outbox_path)
             os.rename(tmp, self.outbox_path)
             self._state["offset"] = 0
@@ -136,4 +144,3 @@ class JsonlEventOutbox:
         except Exception:
             _safe_remove(tmp)
             return False
-

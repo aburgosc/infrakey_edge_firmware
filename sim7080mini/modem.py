@@ -244,6 +244,19 @@ class SIM7080:
             return True
         return self._sync_at(tries=3, timeout_ms=1500, gap_ms=250)
 
+    def reset_module(self):
+        _log_debug(self.debug, "[0] Reset modem")
+        self._close_socket_and_wait_closed(close_timeout_ms=2500, wait_closed_ms=1000, settle_ms=200)
+        try:
+            self.hal.send_at("+CGNSPWR=0", "OK", 1500)
+        except Exception:
+            pass
+        ok_reset, _ = self.hal.send_at("+CRESET", "OK", 2500)
+        if not ok_reset:
+            ok_reset, _ = self.hal.send_at("+CFUN=1,1", "OK", 2500)
+        self.hal.sleep(8)
+        return self._sync_at(tries=8, timeout_ms=1500, gap_ms=500)
+
     def set_radio_nbiot(self):
         _log_debug(self.debug, f"[1] NB-IoT B{self.nb_band}")
         self.hal.send_at("+CNMP=38", "OK", 1200)
@@ -480,7 +493,7 @@ class SIM7080:
         self._write_at_noresp('+CAOPEN={},0,"TCP","{}",{}'.format(self.SOCK_ID, target, port))
         ok_retry, mobj_retry, _ = self._read_urc_regex(
             r"\+CAOPEN:\s*(\d+)\s*,\s*(\d+)",
-            timeout_ms=90000,
+            timeout_ms=45000,
             first_token=b"+"
         )
         if ok_retry:

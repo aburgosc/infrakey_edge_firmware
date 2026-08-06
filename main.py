@@ -99,6 +99,7 @@ def _make_ws(client, cfg, token, device_id, debug):
         max_queue=ws_max_queue,
         token_in_query=runtime.get("ws_token_in_query", False),
         connect_host=ws_connect_host,
+        max_buffer_bytes=runtime.get("ws_buffer_max_bytes", 4096),
     )
 
 
@@ -108,6 +109,63 @@ def _collect_gc():
             gc.collect()
         except Exception:
             pass
+
+
+def _mem_info():
+    out = {}
+    if not gc:
+        return out
+    try:
+        if hasattr(gc, "mem_free"):
+            out["free"] = gc.mem_free()
+    except Exception:
+        pass
+    try:
+        if hasattr(gc, "mem_alloc"):
+            out["alloc"] = gc.mem_alloc()
+    except Exception:
+        pass
+    return out
+
+
+def _machine_reset():
+    try:
+        import machine
+        if hasattr(machine, "reset"):
+            machine.reset()
+        if hasattr(machine, "soft_reset"):
+            machine.soft_reset()
+    except Exception:
+        raise
+
+
+def _safe_for_maintenance_reboot(actuator, pipeline):
+    try:
+        state = actuator.state_snapshot()
+    except Exception:
+        state = {}
+    if state.get("security_state") in ("unlocked_authorized", "locking_pending"):
+        return False
+    try:
+        stats = pipeline.stats()
+    except Exception:
+        stats = {}
+    try:
+        if int(stats.get("queue", {}).get("queued", 0) or 0) > 0:
+            return False
+    except Exception:
+        pass
+    try:
+        if int(stats.get("journal", {}).get("inflight", 0) or 0) > 0:
+            return False
+    except Exception:
+        pass
+    try:
+        if int(stats.get("ws", {}).get("queued", 0) or 0) > 0:
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def _log_exception(label, exc):
@@ -161,6 +219,7 @@ def _run_session():
         debug=debug,
         state_save_every=runtime.get("journal_state_save_every", 1),
         processed_id_cache_size=runtime.get("processed_id_cache_size", 128),
+        max_journal_bytes=runtime.get("journal_max_bytes", 65536),
     )
     legacy_importer = None
     if runtime.get("journal_enabled", True):
@@ -247,6 +306,12 @@ def _run_session():
         st, obj, dbg = 0, None, "base-exception:{}".format(repr(exc))
     device_id, token = client.current_credentials(device_id, token)
     client.note_heartbeat_status(st, flush_device_id=device_id, flush_token=token)
+    if st not in (200, 201):
+        print("[heartbeat] startup failed; recovery modem antes de WS")
+        try:
+            client.recover_connectivity(restart_modem=True)
+        except Exception as exc:
+            _log_exception("[heartbeat] startup recovery exception=", exc)
     next_sleep = _safe_next_sleep(cfg, obj, cfg.get("heartbeat_interval_sec", 86400))
     print("[heartbeat] startup status=", st, "next_pull_sec=", next_sleep)
     last_hb_ms = client.hal.ticks_ms()
@@ -259,6 +324,9 @@ def _run_session():
     ws_reconnect_fail_reset_threshold = _bounded_sleep(runtime.get("ws_reconnect_fail_reset_threshold", 3), 3)
     ws_reconnect_fail_modem_reset_threshold = _bounded_sleep(runtime.get("ws_reconnect_fail_modem_reset_threshold", 6), 6)
     last_status_log_ms = 0
+    session_started_ms = client.hal.ticks_ms()
+    last_gc_ms = session_started_ms
+    last_reboot_deferred_log_ms = 0
     ws_reconnect_failures = 0
     ws_down_since_ms = None
     if cfg.get("ws_enabled", False):
@@ -287,6 +355,13 @@ def _run_session():
 
     loop_sleep_ms = _bounded_sleep(runtime.get("loop_sleep_ms", 100), 100)
     loop_error_backoff_ms = _bounded_sleep(runtime.get("loop_error_backoff_ms", 500), 500)
+    gc_collect_interval_sec = _bounded_sleep(runtime.get("gc_collect_interval_sec", 60), 60)
+    gc_log_free = bool(runtime.get("gc_log_free", False))
+    scheduled_reboot_enabled = bool(runtime.get("scheduled_reboot_enabled", False))
+    scheduled_reboot_interval_sec = _bounded_sleep(runtime.get("scheduled_reboot_interval_sec", 21600), 21600)
+    scheduled_reboot_min_uptime_sec = _bounded_sleep(runtime.get("scheduled_reboot_min_uptime_sec", 3600), 3600)
+    scheduled_reboot_only_when_idle = bool(runtime.get("scheduled_reboot_only_when_idle", True))
+    scheduled_reboot_send_heartbeat = bool(runtime.get("scheduled_reboot_send_heartbeat", True))
     legacy_import_batch = max(0, _bounded_sleep(runtime.get("legacy_import_batch", 1), 1))
     journal_compact_min_bytes = max(0, _bounded_sleep(runtime.get("journal_compact_min_bytes", 4096), 4096))
     journal_compact_ratio_pct = max(1, _bounded_sleep(runtime.get("journal_compact_ratio_pct", 50), 50))
@@ -381,6 +456,46 @@ def _run_session():
                     )
 
                 now_ms = client.hal.ticks_ms()
+                if gc_collect_interval_sec > 0 and client.hal.ticks_diff(now_ms, last_gc_ms) >= (gc_collect_interval_sec * 1000):
+                    last_gc_ms = now_ms
+                    _collect_gc()
+                    if gc_log_free and getattr(client, "operational_debug", getattr(client, "debug", 0)):
+                        mem = _mem_info()
+                        if mem:
+                            print("[gc]", "free=", mem.get("free"), "alloc=", mem.get("alloc"))
+
+                if scheduled_reboot_enabled:
+                    uptime_sec = int(client.hal.ticks_diff(now_ms, session_started_ms) // 1000)
+                    if uptime_sec >= scheduled_reboot_min_uptime_sec and uptime_sec >= scheduled_reboot_interval_sec:
+                        can_reboot = True
+                        if scheduled_reboot_only_when_idle:
+                            can_reboot = _safe_for_maintenance_reboot(actuator, pipeline)
+                        if can_reboot:
+                            print("[supervisor] scheduled reboot reason=maintenance uptime=", uptime_sec)
+                            if scheduled_reboot_send_heartbeat:
+                                try:
+                                    battery_v, battery_pct = _read_battery_metrics(client)
+                                    client.heartbeat(device_id, token, battery_v=battery_v, battery_pct=battery_pct)
+                                except Exception as exc:
+                                    _log_exception("[supervisor] scheduled heartbeat exception=", exc)
+                            try:
+                                if ws:
+                                    ws.close()
+                            except Exception:
+                                pass
+                            try:
+                                client.modem.socket_close()
+                            except Exception:
+                                pass
+                            _collect_gc()
+                            _machine_reset()
+                        elif (
+                            getattr(client, "operational_debug", getattr(client, "debug", 0))
+                            and client.hal.ticks_diff(now_ms, last_reboot_deferred_log_ms) >= 60000
+                        ):
+                            last_reboot_deferred_log_ms = now_ms
+                            print("[supervisor] scheduled reboot deferred; device not idle uptime=", uptime_sec)
+
                 if status_log_interval_sec > 0 and client.hal.ticks_diff(now_ms, last_status_log_ms) >= (status_log_interval_sec * 1000):
                     last_status_log_ms = now_ms
                     state = {}

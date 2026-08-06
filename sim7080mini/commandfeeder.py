@@ -76,13 +76,14 @@ class InMemoryCommandQueue:
 class JsonlCommandJournal:
     FORMAT_VERSION = 2
 
-    def __init__(self, journal_path, state_path, dead_letter_path, debug=1, state_save_every=1, processed_id_cache_size=128):
+    def __init__(self, journal_path, state_path, dead_letter_path, debug=1, state_save_every=1, processed_id_cache_size=128, max_journal_bytes=65536):
         self.journal_path = journal_path
         self.state_path = state_path
         self.dead_letter_path = dead_letter_path
         self.debug = debug
         self.state_save_every = max(1, _safe_int(state_save_every, 1))
         self.processed_id_cache_size = max(16, _safe_int(processed_id_cache_size, 128))
+        self.max_journal_bytes = max(4096, _safe_int(max_journal_bytes, 65536))
         self._pull_since_save = 0
         self._stats = {
             "appended": 0,
@@ -253,6 +254,10 @@ class JsonlCommandJournal:
         }
 
     def append(self, cmd_dict):
+        size = _safe_size(self.journal_path)
+        if size >= self.max_journal_bytes:
+            self._log("[journal] max size reached; append skipped size=", size, "max=", self.max_journal_bytes)
+            return False
         record = {
             "format_version": self.FORMAT_VERSION,
             "id": cmd_dict.get("id"),
@@ -366,9 +371,12 @@ class JsonlCommandJournal:
         try:
             with open(self.journal_path, "rb") as src:
                 src.seek(offset)
-                remaining = src.read()
-            with open(tmp, "wb") as dst:
-                dst.write(remaining or b"")
+                with open(tmp, "wb") as dst:
+                    while True:
+                        chunk = src.read(512)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
             _safe_remove(self.journal_path)
             os.rename(tmp, self.journal_path)
             self._state["offset"] = 0
